@@ -127,4 +127,8 @@ new, linked run.
 go test ./...       # includes the cross-language vectors from sigill-dotnet
 ```
 
+The build is reproducible with the toolchain pinned in `go.mod`; CI fails if the committed
+binaries differ from a fresh build. See [SECURITY.md](SECURITY.md) to verify them yourself
+and to report a vulnerability.
+
 Licensed under Apache-2.0.

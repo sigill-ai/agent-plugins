@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  reproducible:
+    # Rebuilds the plugin binaries from source and fails if they differ from what is
+    # committed, so the binaries users install are provably built from this source.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Committed checksums match committed binaries
+        run: cd plugins/sigill-evidence/libexec && sha256sum -c SHA256SUMS
+      - name: Rebuild
+        run: ./build.sh
+      - name: Rebuilt binaries are byte-identical
+        run: |
+          if ! git diff --exit-code --stat -- plugins/sigill-evidence/libexec; then
+            echo "::error::Committed binaries are not what this source builds to. Run ./build.sh with the toolchain in go.mod and commit the result."
+            exit 1
+          fi
