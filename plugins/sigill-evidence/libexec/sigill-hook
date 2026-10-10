@@ -1,0 +1,13 @@
+#!/bin/sh
+# Picks the sigill-hook binary for this OS/architecture.
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+os=$(uname -s | tr '[:upper:]' '[:lower:]')
+arch=$(uname -m)
+case "$arch" in x86_64|amd64) arch=amd64 ;; arm64|aarch64) arch=arm64 ;; esac
+bin="$dir/sigill-hook-$os-$arch"
+if [ ! -x "$bin" ]; then
+  # Never break the session: an unsupported platform simply records nothing.
+  cat >/dev/null
+  exit 0
+fi
+exec "$bin" "$@"

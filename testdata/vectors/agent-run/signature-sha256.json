@@ -1,0 +1,58 @@
+[
+  {
+    "name": "general-jws",
+    "signature": {
+      "signatures": [
+        {
+          "protected": "eyJhbGciOiJFUzI1NiIsInNpZ0QiOnsiY3R5cyI6WyJhcHBsaWNhdGlvbi92bmQuc2lnaWxsLmFnZW50LWV4ZWN1dGlvbitqc29uIl0sImhhc2hWIjpbIkpyOFhOcElrVGNKQUJGanZkOWhaaFU5WjRFR0xSWWtuYW9lNDQ0ZnBWUjQiXSwicGFycyI6WyJ1cm46c2lnaWxsOmVudmVsb3BlIl19LCJ4NWMiOlsiYzNSMVlpQnphV2R1YVc1bklHTmxjblJwWm1sallYUmxJRUVnS0hSb1pTQndjbTlrZFdObGNpaz0iXSwieDV0I1MyNTYiOiJTUDZCRWVkT1dVSTlQbEhiS1NCNUNRWTVTQXNsdjlmZHJPYXRmcVVGbTVrIn0",
+          "signature": "W7bG8nelYRHZX-6FshDcXKF-pE_NLkldJXpTT41PnOU"
+        }
+      ]
+    },
+    "expected": "c234b5c3ef609d1f02f98cc998dcaa72a2a8ae70b882ef69997b7ca6b5471584"
+  },
+  {
+    "name": "hybrid-mldsa-first",
+    "description": "The ML-DSA entry is skipped; unprotected headers are ignored.",
+    "signature": {
+      "signatures": [
+        {
+          "protected": "eyJhbGciOiJNTC1EU0EtODcifQ",
+          "signature": "cG9zdC1xdWFudHVtIHNpZ25hdHVyZSB2YWx1ZQ"
+        },
+        {
+          "protected": "eyJhbGciOiJFUzI1NiIsInNpZ0QiOnsiY3R5cyI6WyJhcHBsaWNhdGlvbi92bmQuc2lnaWxsLmFnZW50LWV4ZWN1dGlvbitqc29uIl0sImhhc2hWIjpbIkpyOFhOcElrVGNKQUJGanZkOWhaaFU5WjRFR0xSWWtuYW9lNDQ0ZnBWUjQiXSwicGFycyI6WyJ1cm46c2lnaWxsOmVudmVsb3BlIl19LCJ4NWMiOlsiYzNSMVlpQnphV2R1YVc1bklHTmxjblJwWm1sallYUmxJRUVnS0hSb1pTQndjbTlrZFdObGNpaz0iXSwieDV0I1MyNTYiOiJTUDZCRWVkT1dVSTlQbEhiS1NCNUNRWTVTQXNsdjlmZHJPYXRmcVVGbTVrIn0",
+          "signature": "W7bG8nelYRHZX-6FshDcXKF-pE_NLkldJXpTT41PnOU",
+          "header": {
+            "stubTimestamp": {
+              "genTime": "2026-10-01T09:00:00Z",
+              "valid": true
+            }
+          }
+        }
+      ]
+    },
+    "expected": "c234b5c3ef609d1f02f98cc998dcaa72a2a8ae70b882ef69997b7ca6b5471584"
+  },
+  {
+    "name": "flattened-jws",
+    "signature": {
+      "protected": "eyJhbGciOiJFUzI1NiIsInNpZ0QiOnsiY3R5cyI6WyJhcHBsaWNhdGlvbi92bmQuc2lnaWxsLmFnZW50LWV4ZWN1dGlvbitqc29uIl0sImhhc2hWIjpbIkpyOFhOcElrVGNKQUJGanZkOWhaaFU5WjRFR0xSWWtuYW9lNDQ0ZnBWUjQiXSwicGFycyI6WyJ1cm46c2lnaWxsOmVudmVsb3BlIl19LCJ4NWMiOlsiYzNSMVlpQnphV2R1YVc1bklHTmxjblJwWm1sallYUmxJRUVnS0hSb1pTQndjbTlrZFdObGNpaz0iXSwieDV0I1MyNTYiOiJTUDZCRWVkT1dVSTlQbEhiS1NCNUNRWTVTQXNsdjlmZHJPYXRmcVVGbTVrIn0",
+      "signature": "W7bG8nelYRHZX-6FshDcXKF-pE_NLkldJXpTT41PnOU"
+    },
+    "expected": "c234b5c3ef609d1f02f98cc998dcaa72a2a8ae70b882ef69997b7ca6b5471584"
+  },
+  {
+    "name": "non-base64url-signature",
+    "description": "Characters outside the base64url alphabet: no digest.",
+    "signature": {
+      "signatures": [
+        {
+          "protected": "eyJhbGciOiJFUzI1NiIsInNpZ0QiOnsiY3R5cyI6WyJhcHBsaWNhdGlvbi92bmQuc2lnaWxsLmFnZW50LWV4ZWN1dGlvbitqc29uIl0sImhhc2hWIjpbIkpyOFhOcElrVGNKQUJGanZkOWhaaFU5WjRFR0xSWWtuYW9lNDQ0ZnBWUjQiXSwicGFycyI6WyJ1cm46c2lnaWxsOmVudmVsb3BlIl19LCJ4NWMiOlsiYzNSMVlpQnphV2R1YVc1bklHTmxjblJwWm1sallYUmxJRUVnS0hSb1pTQndjbTlrZFdObGNpaz0iXSwieDV0I1MyNTYiOiJTUDZCRWVkT1dVSTlQbEhiS1NCNUNRWTVTQXNsdjlmZHJPYXRmcVVGbTVrIn0",
+          "signature": "W7bG8nelYRHZX-6FshDcXKF-pE_NLkldJXpTT41PnOU!!"
+        }
+      ]
+    },
+    "expected": null
+  }
+]

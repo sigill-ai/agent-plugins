@@ -1,0 +1,16 @@
+{
+  "name": "sigill",
+  "owner": {
+    "name": "Sigill",
+    "url": "https://sigill.ai"
+  },
+  "plugins": [
+    {
+      "name": "sigill",
+      "source": "./plugins/sigill-evidence",
+      "description": "Seal every Claude Code session as verifiable agent evidence with Sigill. Blind: only hashes leave your machine.",
+      "version": "0.1.0"
+    }
+  ],
+  "description": "Sigill plugins for Claude Code: verifiable, blind evidence of agent sessions."
+}

@@ -1,0 +1,1062 @@
+// sigill-hook records a Claude Code session as an Agent Evidence Profiles v1
+// run and seals every step with Sigill — blind: only digests leave the machine.
+//
+// Claude Code invokes it once per hook event with the event JSON on stdin
+// (see hooks/hooks.json). Other modes:
+//
+//	sigill-hook export <session-id> [out.json] [--run <name>]   the run as an AgentRunBundle
+//	sigill-hook index <session-id> [--run <name>]               (re)upload envelopes to the index
+//	sigill-hook finalize <session-id>                           seal a requested run_end (spawned by SessionEnd)
+//	sigill-hook status                                          configuration and unfinished runs
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math/rand/v2"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/sigill-ai/claude-plugins/internal/auth"
+	"github.com/sigill-ai/claude-plugins/internal/evidence"
+	"github.com/sigill-ai/claude-plugins/internal/sigill"
+	"github.com/sigill-ai/claude-plugins/internal/state"
+)
+
+const (
+	recorderID   = "urn:sigill:recorder:claude-code"
+	activityName = "agent-session" // fixed and neutral: Sigill must not learn what a session is about
+	controlSetID = "sigill-claude-code-baseline"
+	extKey       = "ai.sigill.claude-code"
+
+	// maxEvents is the portable bundle limit (common rules §7). Ordinary events stop at
+	// maxEvents-1 so run_end always fits as the last one.
+	maxEvents = 2000
+)
+
+// Time budget. hooks.json gives each hook 60s; everything a hook does — waiting for
+// the lock, starting a run, every HTTP call, index delivery — shares one deadline,
+// and a reserve is kept to persist the outcome and return the intended exit code.
+const (
+	hookBudget   = 55 * time.Second
+	persistSlack = 3 * time.Second
+	drainBudget  = 12 * time.Second
+	uploadLimit  = 8 * time.Second
+)
+
+type input struct {
+	SessionID            string          `json:"session_id"`
+	HookEventName        string          `json:"hook_event_name"`
+	Cwd                  string          `json:"cwd"`
+	Source               string          `json:"source"`
+	Reason               string          `json:"reason"`
+	Prompt               string          `json:"prompt"`
+	ToolName             string          `json:"tool_name"`
+	ToolInput            json.RawMessage `json:"tool_input"`
+	ToolResponse         json.RawMessage `json:"tool_response"`
+	ToolError            json.RawMessage `json:"tool_error"`
+	Error                json.RawMessage `json:"error"`
+	IsInterrupt          *bool           `json:"is_interrupt"`
+	ToolUseID            string          `json:"tool_use_id"`
+	AgentID              string          `json:"agent_id"`
+	AgentType            string          `json:"agent_type"`
+	LastAssistantMessage string          `json:"last_assistant_message"`
+}
+
+type config struct {
+	APIURL        string
+	APIKey        string
+	CertificateID string
+	AgentID       string
+	DataDir       string
+	FailClosed    bool
+	Index         bool
+	Consequential map[string]bool
+}
+
+func loadConfig() config {
+	data := os.Getenv("CLAUDE_PLUGIN_DATA")
+	if data == "" {
+		home, _ := os.UserHomeDir()
+		data = filepath.Join(home, ".sigill", "claude-code")
+	}
+	c := config{
+		APIURL:        envOr("SIGILL_API_URL", "https://api.sigill.ai"),
+		APIKey:        os.Getenv("SIGILL_API_KEY"),
+		CertificateID: os.Getenv("SIGILL_CERTIFICATE_ID"),
+		AgentID:       envOr("SIGILL_AGENT_ID", "urn:sigill:agent:claude-code"),
+		DataDir:       data,
+		FailClosed:    os.Getenv("SIGILL_FAIL_CLOSED") == "1",
+		Index:         os.Getenv("SIGILL_INDEX") != "0", // the producer decides; default: upload signed envelopes
+		Consequential: map[string]bool{},
+	}
+	// A config file fills what the environment leaves empty.
+	if raw, err := os.ReadFile(filepath.Join(data, "config.json")); err == nil {
+		var f struct{ APIURL, APIKey, CertificateID, AgentID string }
+		if json.Unmarshal(raw, &f) == nil {
+			if os.Getenv("SIGILL_API_URL") == "" && f.APIURL != "" {
+				c.APIURL = f.APIURL
+			}
+			if c.APIKey == "" {
+				c.APIKey = f.APIKey
+			}
+			if c.CertificateID == "" {
+				c.CertificateID = f.CertificateID
+			}
+			if os.Getenv("SIGILL_AGENT_ID") == "" && f.AgentID != "" {
+				c.AgentID = f.AgentID
+			}
+		}
+	}
+	tools := envOr("SIGILL_CONSEQUENTIAL_TOOLS", "Bash,Write,Edit,MultiEdit,NotebookEdit,mcp__*")
+	for _, t := range strings.Split(tools, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			c.Consequential[t] = true
+		}
+	}
+	return c
+}
+
+func envOr(k, d string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return d
+}
+
+func (c config) isConsequential(tool string) bool {
+	if c.Consequential[tool] {
+		return true
+	}
+	for k := range c.Consequential {
+		if strings.HasSuffix(k, "*") && strings.HasPrefix(tool, strings.TrimSuffix(k, "*")) {
+			return true
+		}
+	}
+	return false
+}
+
+func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "export":
+			os.Exit(cmdExport(os.Args[2:]))
+		case "status":
+			os.Exit(cmdStatus())
+		case "index":
+			os.Exit(cmdIndex(os.Args[2:]))
+		case "finalize":
+			os.Exit(cmdFinalize(os.Args[2:]))
+		case "connect":
+			os.Exit(cmdConnect(os.Args[2:]))
+		case "disconnect":
+			os.Exit(cmdDisconnect())
+		case "version":
+			fmt.Println(sigill.Version)
+			return
+		}
+	}
+	os.Exit(runHook())
+}
+
+// runHook never breaks the user's session: problems are logged and the hook exits 0.
+// The one exception is explicit enforcement (SIGILL_FAIL_CLOSED=1): a consequential
+// tool is then blocked unless its tool_call was durably committed in this invocation —
+// whatever the reason it was not (no credentials, broken run, lock or state failure).
+func runHook() int {
+	hookStart := time.Now()
+	cfg := loadConfig()
+	raw, err := io.ReadAll(io.LimitReader(os.Stdin, 64<<20))
+	var in input
+	if err == nil {
+		err = json.Unmarshal(raw, &in)
+	}
+	enforce := err == nil && cfg.FailClosed && in.HookEventName == "PreToolUse" && cfg.isConsequential(in.ToolName)
+	blocked := func() int {
+		if enforce {
+			fmt.Fprintln(os.Stderr, "Sigill: this consequential action could not be sealed before running, so it was blocked (SIGILL_FAIL_CLOSED=1).")
+			return 2
+		}
+		return 0
+	}
+	if err != nil || in.SessionID == "" {
+		return blocked()
+	}
+	store := state.Store{Dir: cfg.DataDir}
+	ctx, cancel := context.WithDeadline(context.Background(), hookStart.Add(hookBudget-persistSlack))
+	defer cancel()
+	// Credentials are resolved BEFORE the session lock (lock order: credential, then session).
+	be, account, err := newBackend(ctx, cfg)
+	if err != nil {
+		logf(store, "not recording (event %s): %v", in.HookEventName, err)
+		if in.HookEventName == "SessionStart" {
+			connectHint(store, err)
+		}
+		return blocked()
+	}
+	rec := &recorder{cfg: cfg, store: store, be: be, account: account}
+	var run *state.Run
+	err = store.WithLock(ctx, in.SessionID, func() error {
+		var e error
+		run, e = rec.handle(ctx, in)
+		return e
+	})
+	if err != nil {
+		logf(store, "session %s event %s: %v", state.SessionKey(in.SessionID), in.HookEventName, err)
+	}
+	if in.HookEventName == "SessionEnd" && run != nil && run.CloseRequested != "" && !run.Closed {
+		spawnFinalizer(in.SessionID) // run_end is sealed outside this short-lived hook
+		return 0
+	}
+	if cfg.Index {
+		if run != nil {
+			rec.drain(ctx, run, drainBudget, in.HookEventName == "SessionStart")
+		}
+		if in.HookEventName == "SessionStart" {
+			rec.sweep(ctx, in.SessionID)
+		}
+	}
+	if enforce && !rec.toolCallCommitted {
+		return blocked()
+	}
+	return 0
+}
+
+type recorder struct {
+	cfg               config
+	store             state.Store
+	be                sigill.Backend
+	account           string // who records: a run is only ever continued by the account that started it
+	toolCallCommitted bool   // this invocation durably committed a tool_call
+}
+
+// handle maps one hook event to evidence and returns the run it touched.
+func (r *recorder) handle(ctx context.Context, in input) (*state.Run, error) {
+	run, err := r.store.Current(in.SessionID)
+	if err != nil {
+		return nil, err
+	}
+	if run != nil {
+		if err := r.recover(run); err != nil {
+			return run, err
+		}
+		if run.Account != "" && run.Account != r.account && !run.Closed && run.Broken == "" {
+			// Another account or organisation is connected now: the run is left as it is,
+			// never continued, finalized or delivered under the new identity.
+			_ = r.breakRun(run, "the Sigill connection changed to another account or organisation; this run is not continued")
+		}
+		if run.Account != "" && run.Account != r.account {
+			if in.HookEventName == "SessionEnd" {
+				return nil, nil
+			}
+			run = nil // record from here on in a new run of the current account
+		}
+	}
+	if run != nil && (run.Closed || run.Broken != "" || run.CloseRequested != "") {
+		if in.HookEventName != "SessionStart" {
+			// Producer rule: a broken, closed or closing run is never continued.
+			return run, nil
+		}
+		if run.CloseRequested != "" && !run.Closed && run.Broken == "" {
+			// Resumed before the previous run_end was sealed: finish it first.
+			if err := r.finalize(ctx, run); err != nil {
+				return run, err
+			}
+		}
+		run = nil // a resumed session starts a new run; the old one is kept as it is
+	}
+	if run == nil {
+		if in.HookEventName == "SessionEnd" {
+			return nil, nil
+		}
+		if run, err = r.startRun(ctx, in, ""); err != nil {
+			return run, err
+		}
+		if in.HookEventName == "SessionStart" {
+			return run, nil
+		}
+	}
+
+	ext := map[string]any{}
+	if in.AgentID != "" {
+		ext[extKey] = map[string]any{"agentId": in.AgentID, "agentType": in.AgentType}
+	}
+
+	switch in.HookEventName {
+	case "SessionStart":
+		return run, nil // resumed open run: the chain simply continues
+
+	case "UserPromptSubmit":
+		run.PendingInputs = append(run.PendingInputs, evidence.NewObject("model-input", "text/plain", []byte(in.Prompt)))
+		return run, r.store.Save(run)
+
+	case "PreToolUse":
+		conseq := r.cfg.isConsequential(in.ToolName)
+		step := map[string]any{"tool": toolBlock(in.ToolName, in.ToolUseID, true)}
+		objs := []evidence.Object{evidence.NewObject("tool-arguments", "application/json", jsonOrEmpty(in.ToolInput))}
+		run, err = r.event(ctx, run, in, "tool_call", step, conseq, conseq && run.Policy.Consequential, ext, objs)
+		if err == nil {
+			r.toolCallCommitted = true
+		}
+		return run, err
+
+	case "PostToolUse":
+		step := map[string]any{"tool": toolBlock(in.ToolName, in.ToolUseID, false)}
+		objs := []evidence.Object{evidence.NewObject("tool-result", "application/json", jsonOrEmpty(in.ToolResponse))}
+		return r.event(ctx, run, in, "tool_result", step, false, false, ext, objs)
+
+	case "PostToolUseFailure":
+		step := map[string]any{"tool": toolBlock(in.ToolName, in.ToolUseID, false), "detail": "tool failed"}
+		objs := []evidence.Object{evidence.NewObject("tool-result", "application/json", failureResult(in))}
+		return r.event(ctx, run, in, "tool_result", step, false, false, ext, objs)
+
+	case "SubagentStop":
+		objs := []evidence.Object{evidence.NewObject("model-output", "text/markdown", []byte(in.LastAssistantMessage))}
+		return r.event(ctx, run, in, "model_output", nil, false, false, ext, objs)
+
+	case "Stop":
+		objs := append(append([]evidence.Object{}, run.PendingInputs...), evidence.NewObject("model-output", "text/markdown", []byte(in.LastAssistantMessage)))
+		run, err = r.event(ctx, run, in, "model_output", nil, false, false, ext, objs)
+		if err == nil {
+			run.PendingInputs = nil
+			err = r.store.Save(run)
+		}
+		return run, err
+
+	case "SessionEnd":
+		// Record the request durably and fast; the finalizer seals run_end.
+		reason := in.Reason
+		if reason == "" {
+			reason = "other"
+		}
+		run.CloseRequested = reason
+		return run, r.store.Save(run)
+	}
+	return run, nil
+}
+
+// event seals an ordinary event. At the bundle limit the run is closed first and the
+// event opens a new run (explicit segmentation, never a reused correlationId or seq).
+func (r *recorder) event(ctx context.Context, run *state.Run, in input, stepType string, step map[string]any, conseq, stamp bool,
+	ext map[string]any, objs []evidence.Object) (*state.Run, error) {
+	if run.NextSeq >= maxEvents-1 {
+		run.CloseRequested = "event limit"
+		if err := r.finalize(ctx, run); err != nil {
+			return run, err
+		}
+		next, err := r.startRun(ctx, in, run.CorrelationID)
+		if err != nil {
+			return next, err
+		}
+		run = next
+	}
+	return run, r.seal(ctx, run, stepType, step, conseq, stamp, ext, objs)
+}
+
+// finalize seals the requested run_end and closes the run.
+func (r *recorder) finalize(ctx context.Context, run *state.Run) error {
+	if run.Closed || run.Broken != "" {
+		return nil
+	}
+	step := map[string]any{"finalSeq": run.NextSeq, "finalPrevSignatureSha256": run.PrevSig, "runDisposition": "completed"}
+	if run.CloseRequested != "" {
+		step["detail"] = "session ended: " + run.CloseRequested
+	}
+	return r.seal(ctx, run, "run_end", step, false, true, nil, nil)
+}
+
+// startRun creates a new run directory, seals the Control Artifact (BEFORE) and run_start.
+func (r *recorder) startRun(ctx context.Context, in input, segmentOf string) (*state.Run, error) {
+	now := time.Now()
+	uuid := evidence.NewUUID()
+	run := &state.Run{
+		SessionID:     in.SessionID,
+		Name:          now.UTC().Format("20060102T150405Z") + "-" + uuid[:8],
+		CorrelationID: "urn:uuid:" + uuid,
+		AgentID:       r.cfg.AgentID,
+		AgentVersion:  claudeVersion(ctx),
+		Policy:        evidence.TimestampPolicy{Profile: "throughput", Consequential: true},
+		URIs:          map[string]string{},
+		StartedAt:     now,
+		SegmentOf:     segmentOf,
+		Account:       r.account,
+	}
+	// One run, one signer: the certificate is fixed when the run starts — the
+	// organisation's own (BYOC, recommended) when configured, else the Sigill Platform Seal.
+	run.CertificateID = r.cfg.CertificateID
+	if run.CertificateID == "" {
+		id, err := r.be.PlatformCertificate(ctx)
+		if err != nil {
+			return nil, err
+		}
+		run.CertificateID = id
+	}
+	if err := r.store.NewRun(run); err != nil {
+		return nil, err
+	}
+	objs := []evidence.Object{
+		evidence.NewObject("instruction-set", "text/markdown", collect(in.Cwd, []string{"CLAUDE.md", ".claude/CLAUDE.md"}, ".claude/CLAUDE.md")),
+		evidence.NewObject("execution-policy", "application/json", collect(in.Cwd, []string{".claude/settings.json", ".claude/settings.local.json"}, ".claude/settings.json")),
+		evidence.NewObject("control-set", "application/json", baselineControlSet(r.cfg)),
+	}
+	env := evidence.ControlArtifact(now, evidence.Actor{Type: "system", ID: recorderID, Version: sigill.Version},
+		activityName, run.CorrelationID, run.AgentID, run.AgentVersion, controlSetID, "1", run.Policy, objs)
+	if err := r.commitSealed(ctx, run, env, evidence.ControlArtifactContentType, objs, true, state.Pending{Name: "ctrl", Seq: -1}); err != nil {
+		return run, err
+	}
+	// session: a one-way reference to the Claude Code session, so a resumed session or one split at
+	// the event limit is shown as one trace. It reveals nothing about the session or its user.
+	src := map[string]any{"source": in.Source, "session": sessionRef(in.SessionID)}
+	if segmentOf != "" {
+		src["segmentOf"] = segmentOf
+	}
+	return run, r.seal(ctx, run, "run_start", nil, false, false, map[string]any{extKey: src}, nil)
+}
+
+// seal builds the next chain event and commits it.
+func (r *recorder) seal(ctx context.Context, run *state.Run, stepType string, step map[string]any, conseq, stamp bool, ext map[string]any, objs []evidence.Object) error {
+	controlSig := ""
+	if run.NextSeq == 0 {
+		controlSig = run.ControlSig // run_start binds the control basis
+	}
+	env := evidence.Event(time.Now(), evidence.Actor{Type: "agent", ID: run.AgentID, Version: run.AgentVersion},
+		activityName, run.CorrelationID, run.NextSeq, run.PrevSig, controlSig, stepType, step, conseq, stamp, ext, objs)
+	p := state.Pending{Name: fmt.Sprintf("%04d-%s", run.NextSeq, stepType), Seq: run.NextSeq, Close: stepType == "run_end"}
+	return r.commitSealed(ctx, run, env, evidence.ExecutionEvidenceContentType, objs, stamp, p)
+}
+
+// commitSealed is the crash-consistent commit protocol for one artifact:
+//
+//  1. persist Pending (what is about to be sealed) — before any network I/O;
+//  2. request the seal; any failure, or a missing required timestamp, stops the run;
+//  3. persist the artifact (and its outbox entry) atomically;
+//  4. advance the chain head and clear Pending in one atomic state write.
+//
+// After a crash, recover() completes step 4 when step 3 is on disk and otherwise
+// stops the run. A sequence number is never issued twice.
+func (r *recorder) commitSealed(ctx context.Context, run *state.Run, env map[string]any, contentType string,
+	objs []evidence.Object, stamp bool, p state.Pending) error {
+	canonical, hash, err := evidence.EnvelopeHash(env)
+	if err != nil {
+		return r.breakRun(run, "envelope could not be canonicalized")
+	}
+	p.EnvelopeHash = hash
+	run.Pending = &p
+	if err := r.store.Save(run); err != nil {
+		run.Pending = nil
+		return err // nothing was requested; the run is unchanged on disk
+	}
+	res, err := r.sealWithRetry(ctx, hash, contentType, run.CertificateID, objs, stamp)
+	if err == nil && evidence.SignatureSha256(res.Signature) == "" {
+		err = errors.New("seal response has no classical signature")
+	}
+	if err == nil && stamp {
+		err = evidence.CheckSignatureTimestamp(res.Signature) // common rules §6.2
+	}
+	if err != nil {
+		return r.breakRun(run, fmt.Sprintf("%s could not be sealed: %v", p.Name, err))
+	}
+	art := state.Artifact{Envelope: canonical, Signature: res.Signature, ObjectDigests: evidence.Digests(objs)}
+	if err := r.store.SaveArtifact(run, p.Name, art, r.cfg.Index); err != nil {
+		return r.breakRun(run, fmt.Sprintf("%s was sealed but could not be stored: %v", p.Name, err))
+	}
+	return r.advance(run, p, evidence.SignatureSha256(res.Signature))
+}
+
+// sealWithRetry retries only a request refused BEFORE processing (throttling), as the same
+// pending event, within the hook deadline. Anything else — including an ambiguous timeout —
+// is returned and stops the run (common rules §6.3: never skip an event and continue).
+func (r *recorder) sealWithRetry(ctx context.Context, hash, contentType, cert string, objs []evidence.Object, stamp bool) (*sigill.SealResult, error) {
+	for {
+		res, err := r.be.SignHashes(ctx, hash, contentType, cert, objs, stamp)
+		var re *sigill.RetryableError
+		if !errors.As(err, &re) {
+			return res, err
+		}
+		wait := re.After + time.Duration(rand.IntN(500))*time.Millisecond
+		if time.Until(deadlineOf(ctx)) < wait+2*time.Second {
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-time.After(wait):
+		}
+	}
+}
+
+// advance moves the chain head past a stored artifact (step 4).
+func (r *recorder) advance(run *state.Run, p state.Pending, sig string) error {
+	if p.Seq < 0 {
+		run.ControlSig = sig
+	} else {
+		run.PrevSig = sig
+		run.NextSeq = p.Seq + 1
+	}
+	if p.Close {
+		run.Closed = true
+	}
+	run.Pending = nil
+	return r.store.Save(run)
+}
+
+// recover completes or stops an interrupted commit (see commitSealed).
+func (r *recorder) recover(run *state.Run) error {
+	p := run.Pending
+	if p == nil || run.Broken != "" {
+		return nil
+	}
+	if a, err := r.store.LoadArtifact(run, p.Name); err == nil {
+		if _, h, herr := evidence.EnvelopeHash(json.RawMessage(a.Envelope)); herr == nil && h == p.EnvelopeHash {
+			if sig := evidence.SignatureSha256(a.Signature); sig != "" {
+				return r.advance(run, *p, sig)
+			}
+		}
+	}
+	return r.breakRun(run, fmt.Sprintf("interrupted while sealing %s; the outcome is unknown, so the run is not continued", p.Name))
+}
+
+func (r *recorder) breakRun(run *state.Run, reason string) error {
+	run.Broken = reason
+	run.Pending = nil
+	if err := r.store.Save(run); err != nil {
+		return fmt.Errorf("%s (and the run state could not be saved: %v)", reason, err)
+	}
+	return errors.New(reason)
+}
+
+// Index delivery is batched (DESIGN-4): a batch is at most indexBatchItems artifacts and
+// indexBatchBytes serialized, under the MCP request limit; a drain only runs when enough
+// is queued, the oldest entry has waited long enough, or a flush is forced (session start,
+// finalize).
+const (
+	indexBatchItems = 50
+	indexBatchBytes = 192 << 10
+	flushItems      = 20
+	flushAge        = 60 * time.Second
+)
+
+// drain delivers the run's queued artifacts to the index within budget. Failures never
+// affect the session: retryable ones stay queued, permanent rejections are logged and dropped.
+func (r *recorder) drain(ctx context.Context, run *state.Run, budget time.Duration, force bool) {
+	if run.Account != "" && run.Account != r.account {
+		return // never deliver one account's run under another
+	}
+	pending := r.store.PendingDelivery(run)
+	if len(pending) == 0 || (!force && !run.Closed && len(pending) < flushItems && r.store.OldestPendingAge(run) < flushAge) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	for len(pending) > 0 {
+		left := time.Until(deadlineOf(ctx))
+		if left < time.Second {
+			return
+		}
+		batch, size := []sigill.IndexItem{}, 0
+		for len(pending) > 0 && len(batch) < indexBatchItems {
+			a, err := r.store.LoadArtifact(run, pending[0])
+			if err != nil {
+				r.store.Delivered(run, pending[0]) // nothing to deliver
+				pending = pending[1:]
+				continue
+			}
+			item := sigill.IndexItem{Key: pending[0], Envelope: a.Envelope, Signature: a.Signature, ObjectDigests: a.ObjectDigests}
+			n := len(a.Envelope) + len(a.Signature) + 256
+			if len(batch) > 0 && size+n > indexBatchBytes {
+				break
+			}
+			batch, size = append(batch, item), size+n
+			pending = pending[1:]
+		}
+		if len(batch) == 0 {
+			return
+		}
+		uctx, ucancel := context.WithTimeout(ctx, min(left, 2*uploadLimit))
+		outcomes, err := r.be.IndexBatch(uctx, batch)
+		ucancel()
+		if err != nil {
+			logf(r.store, "run %s: index unavailable, %d queued for retry", run.Name, len(batch)+len(pending))
+			return
+		}
+		retry := false
+		for _, o := range outcomes {
+			switch o.Status {
+			case "indexed", "exists":
+				r.store.Delivered(run, o.Key)
+			case "rejected":
+				logf(r.store, "run %s %s: index rejected (%s), not retried", run.Name, o.Key, o.Code)
+				r.store.Delivered(run, o.Key)
+			default:
+				retry = true
+			}
+		}
+		if retry || len(outcomes) < len(batch) {
+			return // try again on a later hook
+		}
+	}
+}
+
+// sweep finishes other sessions' runs whose finalizer did not complete (the process
+// was killed, the machine slept): at most one per hook, only with time to spare.
+func (r *recorder) sweep(ctx context.Context, self string) {
+	for _, key := range r.store.SessionKeys() {
+		if time.Until(deadlineOf(ctx)) < 20*time.Second || key == state.SessionKey(self) {
+			continue
+		}
+		run, err := r.store.CurrentForKey(key)
+		if err != nil || run == nil || run.Closed || run.Broken != "" || run.CloseRequested == "" ||
+			(run.Account != "" && run.Account != r.account) {
+			continue
+		}
+		_ = r.store.WithLock(ctx, run.SessionID, func() error {
+			cur, err := r.store.Current(run.SessionID)
+			if err != nil || cur == nil || cur.Name != run.Name {
+				return err
+			}
+			if err := r.recover(cur); err != nil {
+				return err
+			}
+			if cur.Closed || cur.Broken != "" || cur.CloseRequested == "" {
+				return nil
+			}
+			return r.finalize(ctx, cur)
+		})
+		return
+	}
+}
+
+func deadlineOf(ctx context.Context) time.Time {
+	if d, ok := ctx.Deadline(); ok {
+		return d
+	}
+	return time.Now().Add(hookBudget)
+}
+
+// spawnFinalizer starts `sigill-hook finalize` in its own session so it outlives the
+// SessionEnd hook, whose time budget Claude Code keeps short.
+func spawnFinalizer(session string) {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	cmd := exec.Command(exe, "finalize", session)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if cmd.Start() == nil {
+		_ = cmd.Process.Release()
+	}
+}
+
+func cmdFinalize(args []string) int {
+	if len(args) < 1 {
+		return 2
+	}
+	cfg := loadConfig()
+	store := state.Store{Dir: cfg.DataDir}
+	ctx, cancel := context.WithTimeout(context.Background(), hookBudget)
+	defer cancel()
+	be, account, err := newBackend(ctx, cfg)
+	if err != nil {
+		logf(store, "finalize %s: %v", state.SessionKey(args[0]), err)
+		return 0 // the next session start finishes it once connected
+	}
+	rec := &recorder{cfg: cfg, store: store, be: be, account: account}
+	var run *state.Run
+	err = store.WithLock(ctx, args[0], func() error {
+		cur, err := store.Current(args[0])
+		if err != nil || cur == nil || (cur.Account != "" && cur.Account != account) {
+			return err
+		}
+		run = cur
+		if err := rec.recover(cur); err != nil {
+			return err
+		}
+		if cur.CloseRequested == "" || cur.Closed || cur.Broken != "" {
+			return nil
+		}
+		return rec.finalize(ctx, cur)
+	})
+	if err != nil {
+		logf(store, "finalize %s: %v", state.SessionKey(args[0]), err)
+	}
+	if cfg.Index && run != nil {
+		rec.drain(ctx, run, 20*time.Second, true)
+	}
+	return 0
+}
+
+func toolBlock(name, useID string, withOperation bool) map[string]any {
+	b := map[string]any{"name": name}
+	if withOperation {
+		if op := operation(name); op != "" {
+			b["operation"] = op
+		}
+	}
+	if useID != "" {
+		b["useId"] = useID
+	}
+	return b
+}
+
+func operation(tool string) string {
+	switch tool {
+	case "Read", "Grep", "Glob", "LS", "WebSearch", "WebFetch":
+		return "read"
+	case "Write", "Edit", "MultiEdit", "NotebookEdit":
+		return "write"
+	case "Bash":
+		return "execute"
+	case "Agent", "Task":
+		return "delegate"
+	}
+	return ""
+}
+
+func jsonOrEmpty(raw json.RawMessage) []byte {
+	if len(raw) == 0 {
+		return []byte("null")
+	}
+	return raw
+}
+
+// failureResult is the local representation of a failed tool call that its digest pins:
+// the hook's failure fields, never sent anywhere (only their digest is).
+func failureResult(in input) []byte {
+	out, _ := json.Marshal(map[string]any{
+		"tool_response": in.ToolResponse,
+		"tool_error":    in.ToolError,
+		"error":         in.Error,
+		"is_interrupt":  in.IsInterrupt,
+	})
+	return out
+}
+
+// Configuration collection bounds: the control basis pins the configuration files that
+// applied, read as regular files only, within these sizes. Content stays local.
+const (
+	maxConfigFile  = 256 << 10
+	maxConfigTotal = 1 << 20
+)
+
+// collect concatenates the configuration files that applied, one header per file, so
+// their digest pins the exact configuration. A file that exists but cannot be pinned
+// (not a regular file, too large, unreadable) is recorded as such — never silently skipped.
+func collect(cwd string, rel []string, homeRel string) []byte {
+	var b strings.Builder
+	paths := []string{}
+	for _, p := range rel {
+		paths = append(paths, filepath.Join(cwd, p))
+	}
+	if h, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(h, homeRel))
+	}
+	total := 0
+	for _, p := range paths {
+		data, err := readConfigFile(p, min(maxConfigFile, maxConfigTotal-total))
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			continue
+		case err != nil:
+			fmt.Fprintf(&b, "=== %s NOT PINNED: %v\n", p, err)
+		default:
+			total += len(data)
+			fmt.Fprintf(&b, "=== %s (%d bytes)\n", p, len(data))
+			b.Write(data)
+			b.WriteString("\n")
+		}
+	}
+	return []byte(b.String())
+}
+
+// readConfigFile follows a symlink to its target but reads only a regular file, never
+// blocking on a FIFO or device, and at most max bytes.
+func readConfigFile(p string, max int) ([]byte, error) {
+	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, errors.New("not a regular file")
+	}
+	if fi.Size() > int64(max) {
+		return nil, fmt.Errorf("larger than %d bytes", max)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, int64(max)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > max {
+		return nil, fmt.Errorf("larger than %d bytes", max)
+	}
+	return data, nil
+}
+
+func baselineControlSet(cfg config) []byte {
+	tools := []string{}
+	for t := range cfg.Consequential {
+		tools = append(tools, t)
+	}
+	sort.Strings(tools)
+	out, _ := json.Marshal(map[string]any{
+		"id": controlSetID, "version": "1",
+		"description":        "Recorder baseline: every tool call and result is sealed in capture order; consequential tools are timestamped before they run.",
+		"consequentialTools": tools,
+	})
+	return out
+}
+
+func claudeVersion(ctx context.Context) string {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "claude", "--version").Output()
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(string(out)), "(Claude Code)"))
+}
+
+// logf writes a diagnostic line. Lines carry ids, step names and status codes only —
+// never content, envelopes, response bodies or credentials.
+func logf(store state.Store, format string, args ...any) {
+	store.AppendLog(time.Now().UTC().Format(time.RFC3339) + " " + fmt.Sprintf(format, args...))
+}
+
+// selectRun resolves [--run <name>] (default: the session's current run).
+func selectRun(store state.Store, session string, args []string) (*state.Run, []string, error) {
+	rest := []string{}
+	name := ""
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--run" && i+1 < len(args) {
+			name = args[i+1]
+			i++
+			continue
+		}
+		rest = append(rest, args[i])
+	}
+	if name == "" {
+		run, err := store.Current(session)
+		if run == nil && err == nil {
+			err = errors.New("no recorded run for that session")
+		}
+		return run, rest, err
+	}
+	run, err := store.LoadRun(session, name)
+	return run, rest, err
+}
+
+// cmdExport writes one run as an AgentRunBundle (common rules §7).
+func cmdExport(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: sigill-hook export <session-id> [out.json] [--run <name>]")
+		return 2
+	}
+	cfg := loadConfig()
+	store := state.Store{Dir: cfg.DataDir}
+	run, rest, err := selectRun(store, args[0], args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, "runs of this session:", strings.Join(store.Runs(args[0]), ", "))
+		return 1
+	}
+	var control *state.Artifact
+	events := []state.Artifact{}
+	for _, n := range store.ArtifactNames(run) {
+		a, err := store.LoadArtifact(run, n)
+		if err != nil {
+			continue
+		}
+		if n == "ctrl" {
+			control = &a
+		} else {
+			events = append(events, a)
+		}
+	}
+	bundle := map[string]any{"format": "AgentRunBundle", "bundleVersion": "1", "correlationId": run.CorrelationID, "controlArtifact": control, "artifacts": events}
+	out, _ := json.MarshalIndent(bundle, "", "  ")
+	if len(rest) > 0 {
+		if err := os.WriteFile(rest[0], out, 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
+	}
+	os.Stdout.Write(out)
+	return 0
+}
+
+func cmdStatus() int {
+	cfg := loadConfig()
+	fmt.Printf("sigill-hook %s\napi: %s\n", sigill.Version, cfg.APIURL)
+	if cfg.APIKey != "" {
+		fmt.Println("auth: API key (SIGILL_API_KEY) — Sigill sign-in is not used while a key is set")
+	} else {
+		m := auth.New(cfg.DataDir)
+		cred, _ := m.Current()
+		switch {
+		case cred == nil:
+			fmt.Println("auth: not connected — run /sigill:connect")
+		case cred.Uncertain != "":
+			fmt.Printf("auth: Sigill sign-in, needs renewal (%s) — run /sigill:connect\n", cred.Uncertain)
+		default:
+			fmt.Printf("auth: Sigill sign-in, organisation %s, connected %s, stored in %s\n",
+				cred.TenantID, cred.ConnectedAt.Format("2006-01-02"), m.Store.Name())
+		}
+	}
+	fmt.Printf("certificate: %s\nagent: %s\ndata: %s\nfail-closed: %v\nindex upload: %v\n",
+		certText(cfg.CertificateID), cfg.AgentID, cfg.DataDir, cfg.FailClosed, cfg.Index)
+	store := state.Store{Dir: cfg.DataDir}
+	for _, key := range store.SessionKeys() {
+		run, err := store.CurrentForKey(key)
+		if err != nil || run == nil {
+			continue
+		}
+		switch {
+		case run.Broken != "":
+			fmt.Printf("run %s: stopped — %s\n", run.Name, run.Broken)
+		case run.CloseRequested != "" && !run.Closed:
+			fmt.Printf("run %s: session ended, run_end not sealed yet (next session start finishes it)\n", run.Name)
+		}
+		if n := len(store.PendingDelivery(run)); n > 0 {
+			fmt.Printf("run %s: %d artifacts waiting for index delivery\n", run.Name, n)
+		}
+	}
+	return 0
+}
+
+func certText(id string) string {
+	if id == "" {
+		return "Sigill Platform Seal (set SIGILL_CERTIFICATE_ID to seal with your own certificate — recommended)"
+	}
+	return id + " (your certificate)"
+}
+
+// cmdIndex (re)uploads every sealed artifact of one run to the evidence index.
+// Safe to repeat: the platform answers an already indexed seal with 200.
+func cmdIndex(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: sigill-hook index <session-id> [--run <name>]")
+		return 2
+	}
+	cfg := loadConfig()
+	store := state.Store{Dir: cfg.DataDir}
+	run, _, err := selectRun(store, args[0], args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	be, account, err := newBackend(ctx, cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if run.Account != "" && run.Account != account {
+		fmt.Fprintln(os.Stderr, "this run was recorded under another account or organisation; connect that account to upload it")
+		return 1
+	}
+	failed := 0
+	for _, n := range store.ArtifactNames(run) {
+		a, err := store.LoadArtifact(run, n)
+		if err != nil {
+			continue
+		}
+		out, err := be.IndexBatch(ctx, []sigill.IndexItem{{Key: n, Envelope: a.Envelope, Signature: a.Signature, ObjectDigests: a.ObjectDigests}})
+		if err != nil || len(out) != 1 || (out[0].Status != "indexed" && out[0].Status != "exists") {
+			failed++
+			fmt.Fprintf(os.Stderr, "%s: not indexed\n", n)
+			continue
+		}
+		store.Delivered(run, n)
+	}
+	if failed > 0 {
+		return 1
+	}
+	return 0
+}
+
+// newBackend picks the transport. The mode is explicit and never falls back: an API key in
+// SIGILL_API_KEY selects REST (headless CI); otherwise Sigill sign-in (OAuth) over MCP. An
+// expired or revoked sign-in never silently switches to a key, and vice versa.
+func newBackend(ctx context.Context, cfg config) (sigill.Backend, string, error) {
+	if cfg.APIKey != "" {
+		sum := sha256.Sum256([]byte(cfg.APIKey))
+		return sigill.New(cfg.APIURL, cfg.APIKey), "apikey|" + strings.TrimRight(cfg.APIURL, "/") + "|" + hex.EncodeToString(sum[:8]), nil
+	}
+	m := auth.New(cfg.DataDir)
+	token, cred, err := m.AccessToken(ctx, cfg.APIURL)
+	if err != nil {
+		return nil, "", err
+	}
+	return sigill.NewMCP(cred.Issuer, token), cred.Account(), nil
+}
+
+// connectHint tells the user, at most once a day, why nothing is being recorded. Printed
+// as the SessionStart hook's systemMessage.
+func connectHint(store state.Store, err error) {
+	if !store.Once("connect-hint", 24*time.Hour) {
+		return
+	}
+	msg := "Sigill: this session is not being recorded — run /sigill:connect to sign in."
+	if !errors.Is(err, auth.ErrNotConnected) {
+		msg = "Sigill: this session is not being recorded — " + err.Error()
+	}
+	out, _ := json.Marshal(map[string]string{"systemMessage": msg})
+	fmt.Println(string(out))
+}
+
+func cmdConnect(args []string) int {
+	cfg := loadConfig()
+	if cfg.APIKey != "" {
+		fmt.Fprintln(os.Stderr, "SIGILL_API_KEY is set, so the plugin uses the API key. Unset it to use Sigill sign-in.")
+		return 1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	defer cancel()
+	m := auth.New(cfg.DataDir)
+	cred, err := m.Connect(ctx, auth.ConnectOptions{
+		Issuer: cfg.APIURL, ClientID: os.Getenv("SIGILL_OAUTH_CLIENT_ID"), UseDCR: os.Getenv("SIGILL_OAUTH_DCR") == "1",
+		OpenBrowser: auth.OpenBrowser, Out: os.Stdout,
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Not connected:", err)
+		return 1
+	}
+	fmt.Printf("Connected to Sigill (organisation %s). Sessions are recorded from the next session start.\n", cred.TenantID)
+	return 0
+}
+
+func cmdDisconnect() int {
+	cfg := loadConfig()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := auth.New(cfg.DataDir).Disconnect(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	fmt.Println("Disconnected from Sigill.")
+	return 0
+}
+
+// sessionRef is the producer-stated session reference: SHA-256 over a fixed label and the
+// Claude Code session id, first 128 bits as hex.
+func sessionRef(sessionID string) string {
+	sum := sha256.Sum256([]byte("sigill-claude-code-session:" + sessionID))
+	return hex.EncodeToString(sum[:16])
+}
