@@ -92,6 +92,18 @@
           }
         ]
       }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/libexec/sigill-hook\"",
+            "timeout": 60
+          }
+        ]
+      }
     ]
   }
 }

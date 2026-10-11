@@ -4,7 +4,7 @@
 // Claude Code invokes it once per hook event with the event JSON on stdin
 // (see hooks/hooks.json). Other modes:
 //
-//	sigill-hook export <session-id> [out.json] [--run <name>]   the run as an AgentRunBundle
+//	sigill-hook export <session-id> [out.json] [--run <name>] [--tree]   the run (or its run tree) as a bundle
 //	sigill-hook index <session-id> [--run <name>]               (re)upload envelopes to the index
 //	sigill-hook finalize <session-id>                           seal a requested run_end (spawned by SessionEnd)
 //	sigill-hook status                                          configuration and unfinished runs
@@ -220,7 +220,7 @@ func runHook() int {
 	}
 	if cfg.Index {
 		if run != nil {
-			rec.drain(ctx, run, drainBudget, in.HookEventName == "SessionStart")
+			rec.drainSession(ctx, run, drainBudget, in.HookEventName == "SessionStart")
 		}
 		if in.HookEventName == "SessionStart" {
 			rec.sweep(ctx, in.SessionID)
@@ -287,9 +287,25 @@ func (r *recorder) handle(ctx context.Context, in input) (*state.Run, error) {
 		}
 	}
 
+	// Agent Delegation v1: a sub-agent's hooks (they carry its agent_id) belong to its own run when one
+	// was opened for it at SubagentStart. Without one (a run started by an older version, no room for a
+	// delegation, or a missed SubagentStart) they are recorded in this run, tagged, as before.
+	target := run
 	ext := map[string]any{}
-	if in.AgentID != "" {
-		ext[extKey] = map[string]any{"agentId": in.AgentID, "agentType": in.AgentType}
+	if in.AgentID != "" && in.HookEventName != "SubagentStart" {
+		child, err := r.childByAgent(run.SessionID, in.AgentID)
+		if err != nil {
+			return run, err
+		}
+		switch {
+		case child != nil && (child.Closed || child.Broken != ""):
+			logf(r.store, "run %s: sub-agent event %s after its run ended, not recorded", child.Name, in.HookEventName)
+			return run, nil
+		case child != nil:
+			target = child
+		default:
+			ext[extKey] = map[string]any{"agentId": in.AgentID, "agentType": in.AgentType}
+		}
 	}
 
 	switch in.HookEventName {
@@ -301,28 +317,44 @@ func (r *recorder) handle(ctx context.Context, in input) (*state.Run, error) {
 		return run, r.store.Save(run)
 
 	case "PreToolUse":
-		conseq := r.cfg.isConsequential(in.ToolName)
-		step := map[string]any{"tool": toolBlock(in.ToolName, in.ToolUseID, true)}
-		objs := []evidence.Object{evidence.NewObject("tool-arguments", "application/json", jsonOrEmpty(in.ToolInput))}
-		run, err = r.event(ctx, run, in, "tool_call", step, conseq, conseq && run.Policy.Consequential, ext, objs)
+		if isAgentTool(in.ToolName) && target.Version() == "2" && hasRoomToDelegate(target) {
+			err = r.delegate(ctx, target, in, ext)
+		} else {
+			conseq := r.cfg.isConsequential(in.ToolName)
+			step := map[string]any{"tool": toolBlock(in.ToolName, in.ToolUseID, true)}
+			objs := []evidence.Object{evidence.NewObject("tool-arguments", "application/json", jsonOrEmpty(in.ToolInput))}
+			err = r.record(ctx, &run, target, in, "tool_call", step, conseq, conseq && target.Policy.Consequential, ext, objs)
+		}
 		if err == nil {
 			r.toolCallCommitted = true
 		}
 		return run, err
 
 	case "PostToolUse":
+		if isAgentTool(in.ToolName) {
+			r.checkPairing(target, in)
+		}
 		step := map[string]any{"tool": toolBlock(in.ToolName, in.ToolUseID, false)}
 		objs := []evidence.Object{evidence.NewObject("tool-result", "application/json", jsonOrEmpty(in.ToolResponse))}
-		return r.event(ctx, run, in, "tool_result", step, false, false, ext, objs)
+		err = r.record(ctx, &run, target, in, "tool_result", step, false, false, ext, objs)
+		return run, err
 
 	case "PostToolUseFailure":
 		step := map[string]any{"tool": toolBlock(in.ToolName, in.ToolUseID, false), "detail": "tool failed"}
 		objs := []evidence.Object{evidence.NewObject("tool-result", "application/json", failureResult(in))}
-		return r.event(ctx, run, in, "tool_result", step, false, false, ext, objs)
+		err = r.record(ctx, &run, target, in, "tool_result", step, false, false, ext, objs)
+		return run, err
+
+	case "SubagentStart":
+		return run, r.startChild(ctx, run, in)
 
 	case "SubagentStop":
+		if target != run {
+			return run, r.closeChild(ctx, target, in.LastAssistantMessage, "completed", "")
+		}
 		objs := []evidence.Object{evidence.NewObject("model-output", "text/markdown", []byte(in.LastAssistantMessage))}
-		return r.event(ctx, run, in, "model_output", nil, false, false, ext, objs)
+		err = r.record(ctx, &run, run, in, "model_output", nil, false, false, ext, objs)
+		return run, err
 
 	case "Stop":
 		objs := append(append([]evidence.Object{}, run.PendingInputs...), evidence.NewObject("model-output", "text/markdown", []byte(in.LastAssistantMessage)))
@@ -345,11 +377,28 @@ func (r *recorder) handle(ctx context.Context, in input) (*state.Run, error) {
 	return run, nil
 }
 
+// record seals an event in target; when target is the main run and the event limit opened a new
+// segment, *main follows it.
+func (r *recorder) record(ctx context.Context, main **state.Run, target *state.Run, in input, stepType string, step map[string]any,
+	conseq, stamp bool, ext map[string]any, objs []evidence.Object) error {
+	next, err := r.event(ctx, target, in, stepType, step, conseq, stamp, ext, objs)
+	if target == *main && next != nil {
+		*main = next
+	}
+	return err
+}
+
 // event seals an ordinary event. At the bundle limit the run is closed first and the
 // event opens a new run (explicit segmentation, never a reused correlationId or seq).
 func (r *recorder) event(ctx context.Context, run *state.Run, in input, stepType string, step map[string]any, conseq, stamp bool,
 	ext map[string]any, objs []evidence.Object) (*state.Run, error) {
-	if run.NextSeq >= maxEvents-1 {
+	// One slot per open delegation is reserved for its result, and one for run_end (delegation §4 rule 6).
+	if run.NextSeq >= maxEvents-1-run.Outstanding() {
+		if run.ParentRun != "" {
+			// A sub-agent run cannot continue in a new segment (its parent declared one run): it ends here.
+			logf(r.store, "run %s: event limit reached, the sub-agent's later events are not recorded", run.Name)
+			return run, r.closeChild(ctx, run, "", "aborted", "event limit")
+		}
 		run.CloseRequested = "event limit"
 		if err := r.finalize(ctx, run); err != nil {
 			return run, err
@@ -368,7 +417,14 @@ func (r *recorder) finalize(ctx context.Context, run *state.Run) error {
 	if run.Closed || run.Broken != "" {
 		return nil
 	}
-	step := map[string]any{"finalSeq": run.NextSeq, "finalPrevSignatureSha256": run.PrevSig, "runDisposition": "completed"}
+	// Sub-agents still running end with the session, and their results go in first: a run closes
+	// "completed" only when every delegation has its result (delegation §4 rule 5).
+	r.closeChildren(ctx, run, "session ended")
+	disposition := "completed"
+	if run.Outstanding() > 0 {
+		disposition = "aborted"
+	}
+	step := map[string]any{"finalSeq": run.NextSeq, "finalPrevSignatureSha256": run.PrevSig, "runDisposition": disposition}
 	if run.CloseRequested != "" {
 		step["detail"] = "session ended: " + run.CloseRequested
 	}
@@ -377,6 +433,11 @@ func (r *recorder) finalize(ctx context.Context, run *state.Run) error {
 
 // startRun creates a new run directory, seals the Control Artifact (BEFORE) and run_start.
 func (r *recorder) startRun(ctx context.Context, in input, segmentOf string) (*state.Run, error) {
+	return r.newRun(ctx, in, segmentOf, nil, nil)
+}
+
+// newRun starts the session's main run, or — with parent and d — the sub-agent run d declared.
+func (r *recorder) newRun(ctx context.Context, in input, segmentOf string, parent *state.Run, d *state.Delegation) (*state.Run, error) {
 	now := time.Now()
 	uuid := evidence.NewUUID()
 	run := &state.Run{
@@ -390,10 +451,20 @@ func (r *recorder) startRun(ctx context.Context, in input, segmentOf string) (*s
 		StartedAt:     now,
 		SegmentOf:     segmentOf,
 		Account:       r.account,
+		SchemaVersion: "2",
+	}
+	if d != nil {
+		// The child signs what its parent declared: correlationId and agent id (delegation §3.3).
+		run.Name, run.CorrelationID, run.AgentID = d.ChildRun, d.ChildCorrelationID, d.ChildAgentID
+		run.ParentCorrelationID, run.ParentDelegationSig, run.ParentRun = parent.CorrelationID, d.Sig, parent.Name
+		run.ClaudeAgentID = in.AgentID
+		run.CertificateID = parent.CertificateID
 	}
 	// One run, one signer: the certificate is fixed when the run starts — the
 	// organisation's own (BYOC, recommended) when configured, else the Sigill Platform Seal.
-	run.CertificateID = r.cfg.CertificateID
+	if run.CertificateID == "" {
+		run.CertificateID = r.cfg.CertificateID
+	}
 	if run.CertificateID == "" {
 		id, err := r.be.PlatformCertificate(ctx)
 		if err != nil {
@@ -401,11 +472,21 @@ func (r *recorder) startRun(ctx context.Context, in input, segmentOf string) (*s
 		}
 		run.CertificateID = id
 	}
-	if err := r.store.NewRun(run); err != nil {
+	newDir := r.store.NewRun
+	if d != nil {
+		newDir = r.store.NewChildRun
+	}
+	if err := newDir(run); err != nil {
 		return nil, err
 	}
+	instructions := collect(in.Cwd, []string{"CLAUDE.md", ".claude/CLAUDE.md"}, ".claude/CLAUDE.md")
+	if d != nil {
+		// A sub-agent's instruction set is its definition file (custom agents); built-in types have none.
+		def := filepath.Join(".claude", "agents", safeName(d.SubagentType)+".md")
+		instructions = collect(in.Cwd, []string{def}, def)
+	}
 	objs := []evidence.Object{
-		evidence.NewObject("instruction-set", "text/markdown", collect(in.Cwd, []string{"CLAUDE.md", ".claude/CLAUDE.md"}, ".claude/CLAUDE.md")),
+		evidence.NewObject("instruction-set", "text/markdown", instructions),
 		evidence.NewObject("execution-policy", "application/json", collect(in.Cwd, []string{".claude/settings.json", ".claude/settings.local.json"}, ".claude/settings.json")),
 		evidence.NewObject("control-set", "application/json", baselineControlSet(r.cfg)),
 	}
@@ -413,6 +494,9 @@ func (r *recorder) startRun(ctx context.Context, in input, segmentOf string) (*s
 		activityName, run.CorrelationID, run.AgentID, run.AgentVersion, controlSetID, "1", run.Policy, objs)
 	if err := r.commitSealed(ctx, run, env, evidence.ControlArtifactContentType, objs, true, state.Pending{Name: "ctrl", Seq: -1}); err != nil {
 		return run, err
+	}
+	if d != nil {
+		return run, r.seal(ctx, run, "run_start", nil, false, false, nil, nil)
 	}
 	// session: a one-way reference to the Claude Code session, so a resumed session or one split at
 	// the event limit is shown as one trace. It reveals nothing about the session or its user.
@@ -425,12 +509,16 @@ func (r *recorder) startRun(ctx context.Context, in input, segmentOf string) (*s
 
 // seal builds the next chain event and commits it.
 func (r *recorder) seal(ctx context.Context, run *state.Run, stepType string, step map[string]any, conseq, stamp bool, ext map[string]any, objs []evidence.Object) error {
-	controlSig := ""
+	var binds map[string]any
 	if run.NextSeq == 0 {
-		controlSig = run.ControlSig // run_start binds the control basis
+		binds = map[string]any{"controlArtifactSignatureSha256": run.ControlSig} // run_start binds the control basis
+		if run.ParentCorrelationID != "" {
+			binds["parentDelegationSignatureSha256"] = run.ParentDelegationSig // … and a sub-agent's, its parent's delegation
+			binds["parentCorrelationId"] = run.ParentCorrelationID
+		}
 	}
-	env := evidence.Event(time.Now(), evidence.Actor{Type: "agent", ID: run.AgentID, Version: run.AgentVersion},
-		activityName, run.CorrelationID, run.NextSeq, run.PrevSig, controlSig, stepType, step, conseq, stamp, ext, objs)
+	env := evidence.Event(time.Now(), run.Version(), evidence.Actor{Type: "agent", ID: run.AgentID, Version: run.AgentVersion},
+		activityName, run.CorrelationID, run.NextSeq, run.PrevSig, binds, stepType, step, conseq, stamp, ext, objs)
 	p := state.Pending{Name: fmt.Sprintf("%04d-%s", run.NextSeq, stepType), Seq: run.NextSeq, Close: stepType == "run_end"}
 	return r.commitSealed(ctx, run, env, evidence.ExecutionEvidenceContentType, objs, stamp, p)
 }
@@ -513,13 +601,19 @@ func (r *recorder) advance(run *state.Run, p state.Pending, sig string) error {
 // recover completes or stops an interrupted commit (see commitSealed).
 func (r *recorder) recover(run *state.Run) error {
 	p := run.Pending
-	if p == nil || run.Broken != "" {
+	if run.Broken != "" {
 		return nil
+	}
+	if p == nil {
+		return r.reconcile(run)
 	}
 	if a, err := r.store.LoadArtifact(run, p.Name); err == nil {
 		if _, h, herr := evidence.EnvelopeHash(json.RawMessage(a.Envelope)); herr == nil && h == p.EnvelopeHash {
 			if sig := evidence.SignatureSha256(a.Signature); sig != "" {
-				return r.advance(run, *p, sig)
+				if err := r.advance(run, *p, sig); err != nil {
+					return err
+				}
+				return r.reconcile(run)
 			}
 		}
 	}
@@ -607,6 +701,28 @@ func (r *recorder) drain(ctx context.Context, run *state.Run, budget time.Durati
 	}
 }
 
+// drainSession delivers the queued artifacts of every run of the session — the main run and its
+// sub-agent runs — within one budget.
+func (r *recorder) drainSession(ctx context.Context, main *state.Run, budget time.Duration, force bool) {
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	for _, name := range r.store.Runs(main.SessionID) {
+		left := time.Until(deadlineOf(ctx))
+		if left < time.Second {
+			return
+		}
+		run := main
+		if name != main.Name {
+			loaded, err := r.store.LoadRun(main.SessionID, name)
+			if err != nil || len(r.store.PendingDelivery(loaded)) == 0 {
+				continue
+			}
+			run = loaded
+		}
+		r.drain(ctx, run, left, force)
+	}
+}
+
 // sweep finishes other sessions' runs whose finalizer did not complete (the process
 // was killed, the machine slept): at most one per hook, only with time to spare.
 func (r *recorder) sweep(ctx context.Context, self string) {
@@ -691,7 +807,7 @@ func cmdFinalize(args []string) int {
 		logf(store, "finalize %s: %v", state.SessionKey(args[0]), err)
 	}
 	if cfg.Index && run != nil {
-		rec.drain(ctx, run, 20*time.Second, true)
+		rec.drainSession(ctx, run, 20*time.Second, true)
 	}
 	return 0
 }
@@ -863,7 +979,7 @@ func selectRun(store state.Store, session string, args []string) (*state.Run, []
 // cmdExport writes one run as an AgentRunBundle (common rules §7).
 func cmdExport(args []string) int {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: sigill-hook export <session-id> [out.json] [--run <name>]")
+		fmt.Fprintln(os.Stderr, "usage: sigill-hook export <session-id> [out.json] [--run <name>] [--tree]")
 		return 2
 	}
 	cfg := loadConfig()
@@ -874,6 +990,49 @@ func cmdExport(args []string) int {
 		fmt.Fprintln(os.Stderr, "runs of this session:", strings.Join(store.Runs(args[0]), ", "))
 		return 1
 	}
+	tree := false
+	files := rest[:0]
+	for _, a := range rest {
+		if a == "--tree" {
+			tree = true
+		} else {
+			files = append(files, a)
+		}
+	}
+	rest = files
+	var bundle any = runBundle(store, run)
+	if tree {
+		// The run and every sub-agent run below it (Agent Delegation v1 §6.1).
+		runs := []any{}
+		var walk func(r *state.Run)
+		walk = func(r *state.Run) {
+			runs = append(runs, runBundle(store, r))
+			for _, d := range r.Delegations {
+				if d.ChildRun == "" {
+					continue
+				}
+				if child, err := store.LoadRun(r.SessionID, d.ChildRun); err == nil {
+					walk(child)
+				}
+			}
+		}
+		walk(run)
+		bundle = map[string]any{"format": "AgentRunTreeBundle", "bundleVersion": "1", "rootCorrelationId": run.CorrelationID, "runs": runs}
+	}
+	out, _ := json.MarshalIndent(bundle, "", "  ")
+	if len(rest) > 0 {
+		if err := os.WriteFile(rest[0], out, 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
+	}
+	os.Stdout.Write(out)
+	return 0
+}
+
+// runBundle is one run as an AgentRunBundle (common rules §7), digests only.
+func runBundle(store state.Store, run *state.Run) map[string]any {
 	var control *state.Artifact
 	events := []state.Artifact{}
 	for _, n := range store.ArtifactNames(run) {
@@ -887,17 +1046,7 @@ func cmdExport(args []string) int {
 			events = append(events, a)
 		}
 	}
-	bundle := map[string]any{"format": "AgentRunBundle", "bundleVersion": "1", "correlationId": run.CorrelationID, "controlArtifact": control, "artifacts": events}
-	out, _ := json.MarshalIndent(bundle, "", "  ")
-	if len(rest) > 0 {
-		if err := os.WriteFile(rest[0], out, 0o600); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
-		return 0
-	}
-	os.Stdout.Write(out)
-	return 0
+	return map[string]any{"format": "AgentRunBundle", "bundleVersion": "1", "correlationId": run.CorrelationID, "controlArtifact": control, "artifacts": events}
 }
 
 func cmdStatus() int {

@@ -109,10 +109,11 @@ func ControlArtifact(now time.Time, actor Actor, activity, correlationID, agentI
 	}
 }
 
-// Event builds one DURING envelope (agent-execution-evidence-v1.md).
-// step must already hold the type-specific fields; this adds type, eventTime,
-// consequential and timestamp.
-func Event(now time.Time, actor Actor, activity, correlationID string, seq int, prevSig, controlSig string,
+// Event builds one DURING envelope (agent-execution-evidence-v1.md; schemaVersion "2" adds
+// sub-agent delegation, agent-delegation-v1.md). step must already hold the type-specific
+// fields; this adds type, eventTime, consequential and timestamp. binds is set on run_start
+// only: the Control Artifact, and for a sub-agent run the parent's delegation.
+func Event(now time.Time, schemaVersion string, actor Actor, activity, correlationID string, seq int, prevSig string, binds map[string]any,
 	stepType string, step map[string]any, consequential, stamp bool, extensions map[string]any, objs []Object) map[string]any {
 	if step == nil {
 		step = map[string]any{}
@@ -131,7 +132,7 @@ func Event(now time.Time, actor Actor, activity, correlationID string, seq int, 
 	}
 	env := map[string]any{
 		"schemaName":    ExecutionEvidenceSchema,
-		"schemaVersion": "1",
+		"schemaVersion": schemaVersion,
 		"evidenceId":    NewUUID(),
 		"createdAt":     FormatTime(now),
 		"actor":         actor,
@@ -140,8 +141,8 @@ func Event(now time.Time, actor Actor, activity, correlationID string, seq int, 
 		"step":          step,
 		"objects":       objectsBlock(objs),
 	}
-	if controlSig != "" {
-		env["binds"] = map[string]any{"controlArtifactSignatureSha256": controlSig}
+	if len(binds) > 0 {
+		env["binds"] = binds
 	}
 	if len(extensions) > 0 {
 		env["extensions"] = extensions

@@ -60,6 +60,58 @@ type Run struct {
 	URIs           map[string]string `json:"uris"` // uri → digest; one URI, one content (§5)
 	StartedAt      time.Time         `json:"startedAt"`
 	SegmentOf      string            `json:"segmentOf,omitempty"` // previous run's correlationId when the event limit split a session
+
+	// SchemaVersion of the run's execution artifacts: "2" (Agent Delegation v1) for runs started by
+	// this version; "" means "1" (runs started before). One run never mixes versions.
+	SchemaVersion string `json:"schemaVersion,omitempty"`
+	// A sub-agent run (agent-delegation-v1.md): the parent's correlationId and delegation signature its
+	// run_start binds, the parent run's directory, and the Claude Code agent_id whose hooks it records.
+	ParentCorrelationID string `json:"parentCorrelationId,omitempty"`
+	ParentDelegationSig string `json:"parentDelegationSignatureSha256,omitempty"`
+	ParentRun           string `json:"parentRun,omitempty"`
+	ClaudeAgentID       string `json:"claudeAgentId,omitempty"`
+	// Delegations this run sealed. Each intent is saved with the Pending of the event that commits it,
+	// so after a crash the chain head (NextSeq) decides what was sealed: never two results for one child.
+	Delegations []Delegation `json:"delegations,omitempty"`
+}
+
+// Delegation is one sub-agent this run started.
+type Delegation struct {
+	ChildCorrelationID string `json:"childCorrelationId"`
+	ChildAgentID       string `json:"childAgentId"`
+	SubagentType       string `json:"subagentType"`
+	UseID              string `json:"useId,omitempty"`
+	Seq                int    `json:"seq"`           // the delegation event
+	Sig                string `json:"sig,omitempty"` // its signatureSha256, once committed
+	ChildRun           string `json:"childRun,omitempty"`
+	ClaudeAgentID      string `json:"claudeAgentId,omitempty"`
+	ResultSeq          int       `json:"resultSeq"` // the delegation_result event; -1 none
+	CreatedAt          time.Time `json:"createdAt"`
+}
+
+// Committed: the delegation event is part of the chain.
+func (d Delegation) Committed(r *Run) bool { return d.Seq < r.NextSeq && d.Sig != "" }
+
+// Resolved: its delegation_result is part of the chain.
+func (d Delegation) Resolved(r *Run) bool { return d.ResultSeq >= 0 && d.ResultSeq < r.NextSeq }
+
+// Outstanding counts committed delegations without a committed result.
+func (r *Run) Outstanding() int {
+	n := 0
+	for _, d := range r.Delegations {
+		if d.Committed(r) && !d.Resolved(r) {
+			n++
+		}
+	}
+	return n
+}
+
+// Version is the run's execution schemaVersion.
+func (r *Run) Version() string {
+	if r.SchemaVersion == "" {
+		return "1"
+	}
+	return r.SchemaVersion
 }
 
 // Pending identifies the one artifact being sealed.
@@ -307,6 +359,17 @@ func (s Store) SessionKeys() []string {
 // NewRun creates the run's directory, writes its first state and makes it the
 // session's current run. r.Name must be fresh.
 func (s Store) NewRun(r *Run) error {
+	if err := s.newRunDir(r); err != nil {
+		return err
+	}
+	return writeAtomic(s.sessionDir(r.SessionID), "current", []byte(r.Name))
+}
+
+// NewChildRun creates a sub-agent run's directory and first state. The session's current run
+// (the main thread) is unchanged. r.Name must be fresh.
+func (s Store) NewChildRun(r *Run) error { return s.newRunDir(r) }
+
+func (s Store) newRunDir(r *Run) error {
 	if _, err := mkdirPrivate(s.Dir, "sessions", SessionKey(r.SessionID), "runs"); err != nil {
 		return err
 	}
@@ -314,10 +377,7 @@ func (s Store) NewRun(r *Run) error {
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		return err // never reuse a run directory
 	}
-	if err := s.Save(r); err != nil {
-		return err
-	}
-	return writeAtomic(s.sessionDir(r.SessionID), "current", []byte(r.Name))
+	return s.Save(r)
 }
 
 // Save atomically replaces the run's state.

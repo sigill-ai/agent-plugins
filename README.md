@@ -9,14 +9,18 @@ run and seals every step with [Sigill](https://sigill.ai):
 - **During:** every tool call, tool result and model output is signed and chained to the one
   before it, so a recorded step cannot be removed, inserted or reordered without detection.
   Consequential tools (`Bash`, `Write`, `Edit`, MCP tools …) are sealed and timestamped
-  **before they run**. Sub-agent steps are recorded too, tagged with the sub-agent's role.
+  **before they run**.
+- **Sub-agents:** each sub-agent is recorded as its own run, bound to the session in both
+  directions ([Agent Delegation v1](https://github.com/sigill-ai/sigill-dotnet/blob/main/spec/agent-delegation-v1.md)):
+  the session declares it before it starts, and records its sealed result when it ends. A
+  sub-agent left out of the evidence, swapped or edited afterwards is detected.
 - **After:** the session's `run_end` is timestamped, which freezes the whole chain.
 
 **Blind by design.** Prompts, tool arguments, tool results and model output never leave your
 machine. The plugin hashes them locally; Sigill receives SHA-256 digests and the signed step
 metadata (step types, tool names, times, identifiers) — never content.
 
-> **Status: preview (0.1).** macOS and Linux.
+> **Status: preview (0.2).** macOS and Linux.
 
 ## Install
 
@@ -111,14 +115,18 @@ session start finishes it, and until then the run shows as open.
 |---|---|
 | `SessionStart` | Control Artifact + `run_start` |
 | `UserPromptSubmit` | prompt digest (bound to the next `model_output`) |
-| `PreToolUse` | `tool_call` (sealed before the tool runs) |
+| `PreToolUse` | `tool_call` (sealed before the tool runs); for the `Agent` tool, a `delegation` declaring the sub-agent's run |
 | `PostToolUse` / `PostToolUseFailure` | `tool_result` |
-| `SubagentStop` | sub-agent `model_output` |
+| `SubagentStart` | the sub-agent's own run: Control Artifact + `run_start` bound to the `delegation` |
+| hooks inside a sub-agent | events in the sub-agent's run |
+| `SubagentStop` | the sub-agent's `model_output` + `run_end`, then the session's `delegation_result` |
 | `Stop` | `model_output` |
-| `SessionEnd` | `run_end`, timestamped |
+| `SessionEnd` | sub-agents still running close `aborted`; then `run_end`, timestamped |
 
 A run holds at most 2,000 events (the portable bundle limit); a longer session continues in a
-new, linked run.
+new, linked run, and one event slot per running sub-agent is kept for its result. Export a
+session with its sub-agents as one file: `sigill-hook export <session-id> tree.json --tree`,
+and verify it at [sigill.ai/verify-run](https://sigill.ai/verify-run).
 
 ## Build
 
