@@ -20,7 +20,8 @@ import (
 // the platform's REST ingest stays the only authority either way.
 type Backend interface {
 	PlatformCertificate(ctx context.Context) (string, error)
-	SignHashes(ctx context.Context, envelopeHashHex, contentType, certificateID string, objects []evidence.Object, timestamp bool) (*SealResult, error)
+	// qualified asks for a qualified (eIDAS) timestamp; it only applies when timestamp is true.
+	SignHashes(ctx context.Context, envelopeHashHex, contentType, certificateID string, objects []evidence.Object, timestamp, qualified bool) (*SealResult, error)
 	IndexBatch(ctx context.Context, items []IndexItem) ([]IndexOutcome, error)
 }
 
@@ -209,16 +210,20 @@ func (m *MCPClient) PlatformCertificate(ctx context.Context) (string, error) {
 	return "", errors.New("no active Sigill Platform Seal is available")
 }
 
-func (m *MCPClient) SignHashes(ctx context.Context, envelopeHashHex, contentType, certificateID string, objects []evidence.Object, timestamp bool) (*SealResult, error) {
+func (m *MCPClient) SignHashes(ctx context.Context, envelopeHashHex, contentType, certificateID string, objects []evidence.Object, timestamp, qualified bool) (*SealResult, error) {
 	objs := make([]map[string]string, 0, len(objects))
 	for _, o := range objects {
 		objs = append(objs, map[string]string{"uri": o.URI, "hash_hex": o.SHA256, "content_type": o.ContentType})
 	}
 	var r SealResult
-	err := m.call(ctx, "sigill_seal_agent_artifact", map[string]any{
+	args := map[string]any{
 		"envelope_hash_hex": envelopeHashHex, "envelope_content_type": contentType,
 		"certificate_id": certificateID, "timestamp": timestamp, "objects": objs,
-	}, &r)
+	}
+	if qualified && timestamp {
+		args["qualified"] = true
+	}
+	err := m.call(ctx, "sigill_seal_agent_artifact", args, &r)
 	if err != nil {
 		return nil, err
 	}

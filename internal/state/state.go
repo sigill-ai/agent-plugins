@@ -40,6 +40,7 @@ type Run struct {
 	Name          string `json:"name"` // run directory name
 	CorrelationID string `json:"correlationId"`
 	CertificateID string `json:"certificateId,omitempty"` // fixed for the whole run: one run, one signer
+	Qualified     bool   `json:"qualified,omitempty"`     // qualified timestamps for this run (fixed at start)
 	// Account that started the run (issuer|tenant|user, or the API key's fingerprint). A run is
 	// never continued, finalized or delivered under another account or organisation.
 	Account      string                   `json:"account,omitempty"`

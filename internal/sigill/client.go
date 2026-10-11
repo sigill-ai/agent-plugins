@@ -40,7 +40,7 @@ type signObject struct {
 
 // SignHashes seals an envelope digest plus its object digests (POST /seal/sign-hashes).
 // No label is sent: operation labels derived from event types are not allowed (common rules §6.5).
-func (c *Client) SignHashes(ctx context.Context, envelopeHashHex, envelopeContentType, certificateID string, objects []evidence.Object, timestamp bool) (*SealResult, error) {
+func (c *Client) SignHashes(ctx context.Context, envelopeHashHex, envelopeContentType, certificateID string, objects []evidence.Object, timestamp, qualified bool) (*SealResult, error) {
 	objs := make([]signObject, 0, len(objects))
 	for _, o := range objects {
 		objs = append(objs, signObject{URI: o.URI, HashHex: o.SHA256, ContentType: o.ContentType})
@@ -50,7 +50,7 @@ func (c *Client) SignHashes(ctx context.Context, envelopeHashHex, envelopeConten
 		"envelopeContentType": envelopeContentType,
 		"certificateId":       certificateID,
 		"objects":             objs,
-		"qualified":           false,
+		"qualified":           qualified && timestamp,
 	}
 	if !timestamp {
 		body["timestamp"] = false

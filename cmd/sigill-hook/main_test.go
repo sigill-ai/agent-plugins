@@ -894,3 +894,29 @@ func TestQuotaExceeded_IsReportedAsQuota(t *testing.T) {
 		t.Fatal("a refused quota is not a sealing failure")
 	}
 }
+
+// Qualified timestamps are the producer's choice: off by default, and when chosen only on the
+// artifacts that take a timestamp at all.
+func TestQualifiedTimestamps_AreOptIn_AndOnlyWhereStamped(t *testing.T) {
+	for _, want := range []bool{false, true} {
+		fake := &fakeSigill{}
+		srv := httptest.NewServer(http.HandlerFunc(fake.handler))
+		rec := newRec(t, srv.URL, func(c *config) { c.Qualified = want })
+		sid := fmt.Sprintf("e2000000-0000-4000-8000-00000000000%d", map[bool]int{false: 1, true: 2}[want])
+		for _, e := range []input{
+			{SessionID: sid, HookEventName: "SessionStart", Source: "startup", Cwd: t.TempDir()},
+			{SessionID: sid, HookEventName: "PreToolUse", ToolName: "Read", ToolUseID: "t1", ToolInput: json.RawMessage(`{}`)},
+			{SessionID: sid, HookEventName: "PreToolUse", ToolName: "Bash", ToolUseID: "t2", ToolInput: json.RawMessage(`{}`)},
+		} {
+			mustHook(t, rec, e)
+		}
+		for _, req := range fake.requests {
+			_, off := req["timestamp"]
+			stamped := !off
+			if q, _ := req["qualified"].(bool); q != (want && stamped) {
+				t.Fatalf("qualified=%v on a seal with timestamp=%v (chosen: %v)", q, stamped, want)
+			}
+		}
+		srv.Close()
+	}
+}

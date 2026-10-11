@@ -81,6 +81,7 @@ type config struct {
 	DataDir       string
 	FailClosed    bool
 	Index         bool
+	Qualified     bool // qualified (eIDAS) timestamps where a timestamp is taken; off by default
 	Consequential map[string]bool
 }
 
@@ -98,11 +99,15 @@ func loadConfig() config {
 		DataDir:       data,
 		FailClosed:    os.Getenv("SIGILL_FAIL_CLOSED") == "1",
 		Index:         os.Getenv("SIGILL_INDEX") != "0", // the producer decides; default: upload signed envelopes
+		Qualified:     os.Getenv("SIGILL_QUALIFIED") == "1",
 		Consequential: map[string]bool{},
 	}
 	// A config file fills what the environment leaves empty.
 	if raw, err := os.ReadFile(filepath.Join(data, "config.json")); err == nil {
-		var f struct{ APIURL, APIKey, CertificateID, AgentID string }
+		var f struct {
+			APIURL, APIKey, CertificateID, AgentID string
+			Qualified                              bool
+		}
 		if json.Unmarshal(raw, &f) == nil {
 			if os.Getenv("SIGILL_API_URL") == "" && f.APIURL != "" {
 				c.APIURL = f.APIURL
@@ -115,6 +120,9 @@ func loadConfig() config {
 			}
 			if os.Getenv("SIGILL_AGENT_ID") == "" && f.AgentID != "" {
 				c.AgentID = f.AgentID
+			}
+			if os.Getenv("SIGILL_QUALIFIED") == "" && f.Qualified {
+				c.Qualified = true
 			}
 		}
 	}
@@ -463,6 +471,7 @@ func (r *recorder) newRun(ctx context.Context, in input, segmentOf string, paren
 		SegmentOf:     segmentOf,
 		Account:       r.account,
 		SchemaVersion: "2",
+		Qualified:     r.cfg.Qualified,
 	}
 	if d != nil {
 		// The child signs what its parent declared: correlationId and agent id (delegation §3.3).
@@ -470,9 +479,10 @@ func (r *recorder) newRun(ctx context.Context, in input, segmentOf string, paren
 		run.ParentCorrelationID, run.ParentDelegationSig, run.ParentRun = parent.CorrelationID, d.Sig, parent.Name
 		run.ClaudeAgentID = in.AgentID
 		run.CertificateID = parent.CertificateID
+		run.Qualified = parent.Qualified
 	}
 	// One run, one signer: the certificate is fixed when the run starts — the
-	// organisation's own (BYOC, recommended) when configured, else the Sigill Platform Seal.
+	// organisation's own (BYOC) when configured, else the Sigill Platform Seal.
 	if run.CertificateID == "" {
 		run.CertificateID = r.cfg.CertificateID
 	}
@@ -562,7 +572,7 @@ func (r *recorder) commitSealed(ctx context.Context, run *state.Run, env map[str
 		run.Pending = nil
 		return err // nothing was requested; the run is unchanged on disk
 	}
-	res, err := r.sealWithRetry(ctx, hash, contentType, run.CertificateID, objs, stamp)
+	res, err := r.sealWithRetry(ctx, hash, contentType, run.CertificateID, objs, stamp, run.Qualified)
 	if err == nil && evidence.SignatureSha256(res.Signature) == "" {
 		err = errors.New("seal response has no classical signature")
 	}
@@ -587,9 +597,9 @@ func (r *recorder) commitSealed(ctx context.Context, run *state.Run, env map[str
 // sealWithRetry retries only a request refused BEFORE processing (throttling), as the same
 // pending event, within the hook deadline. Anything else — including an ambiguous timeout —
 // is returned and stops the run (common rules §6.3: never skip an event and continue).
-func (r *recorder) sealWithRetry(ctx context.Context, hash, contentType, cert string, objs []evidence.Object, stamp bool) (*sigill.SealResult, error) {
+func (r *recorder) sealWithRetry(ctx context.Context, hash, contentType, cert string, objs []evidence.Object, stamp, qualified bool) (*sigill.SealResult, error) {
 	for {
-		res, err := r.be.SignHashes(ctx, hash, contentType, cert, objs, stamp)
+		res, err := r.be.SignHashes(ctx, hash, contentType, cert, objs, stamp, qualified)
 		var re *sigill.RetryableError
 		if !errors.As(err, &re) {
 			return res, err
@@ -1132,8 +1142,8 @@ func cmdStatus() int {
 				cred.TenantID, cred.ConnectedAt.Format("2006-01-02"), m.Store.Name())
 		}
 	}
-	fmt.Printf("certificate: %s\nagent: %s\ndata: %s\nfail-closed: %v\nindex upload: %v\n",
-		certText(cfg.CertificateID), cfg.AgentID, cfg.DataDir, cfg.FailClosed, cfg.Index)
+	fmt.Printf("certificate: %s\nagent: %s\ndata: %s\nfail-closed: %v\nindex upload: %v\nqualified timestamps: %v\n",
+		certText(cfg.CertificateID), cfg.AgentID, cfg.DataDir, cfg.FailClosed, cfg.Index, cfg.Qualified)
 	store := state.Store{Dir: cfg.DataDir}
 	for _, key := range store.SessionKeys() {
 		run, err := store.CurrentForKey(key)
@@ -1155,7 +1165,7 @@ func cmdStatus() int {
 
 func certText(id string) string {
 	if id == "" {
-		return "Sigill Platform Seal (set SIGILL_CERTIFICATE_ID to seal with your own certificate — recommended)"
+		return "Sigill Platform Seal (SIGILL_CERTIFICATE_ID selects your organisation's own certificate)"
 	}
 	return id + " (your certificate)"
 }

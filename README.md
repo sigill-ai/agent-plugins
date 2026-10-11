@@ -50,10 +50,9 @@ start it reminds you once a day.
 
 ## Certificates
 
-Runs are sealed with the shared **Sigill Platform Seal** unless you choose a certificate of
-your own. The platform seal proves the record is intact, not who ran the agent. **We
-recommend your organisation's own certificate (BYOC)**: runs are then attributed to your
-organisation. Set its id once:
+Runs are sealed with the **Sigill Platform Seal** — an advanced electronic seal with Sigill's
+organisation certificate — unless you choose a certificate of your own. To seal with your
+organisation's own certificate (BYOC), set its id once:
 
 ```sh
 export SIGILL_CERTIFICATE_ID=...   # Sigill → Settings → Certificates
@@ -65,11 +64,12 @@ The certificate is fixed when a run starts, so every step of a run has one signe
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SIGILL_CERTIFICATE_ID` | platform seal | Your organisation's certificate (recommended) |
+| `SIGILL_CERTIFICATE_ID` | Sigill Platform Seal | Your organisation's own certificate (BYOC) |
 | `SIGILL_AGENT_ID` | `urn:sigill:agent:claude-code` | `agent.id` recorded for the session |
 | `SIGILL_CONSEQUENTIAL_TOOLS` | `Bash,Write,Edit,MultiEdit,NotebookEdit,mcp__*` | Tools timestamped before they run |
 | `SIGILL_FAIL_CLOSED` | off | `1` blocks a consequential tool unless its step was sealed first — including when the plugin is not connected |
 | `SIGILL_INDEX` | on | `0` keeps the signed envelopes local (no upload to your Evidence store) |
+| `SIGILL_QUALIFIED` | off | `1` takes qualified (eIDAS) timestamps where a step is timestamped; uses your organisation's qualified timestamp quota |
 | `SIGILL_API_URL` | `https://api.sigill.ai` | API endpoint. A connection is only ever used with the server it was made for |
 
 ### Headless CI
