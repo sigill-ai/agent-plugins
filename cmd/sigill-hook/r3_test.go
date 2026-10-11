@@ -260,10 +260,9 @@ func TestSessionEnd_DoesNotWaitForTheSigningLock(t *testing.T) {
 		<-done
 		t.Fatal("SessionEnd was still running when the host would have killed it")
 	}
-	req, ok := rec.store.CloseRequestFor(sid)
 	run, _ := rec.store.Current(sid)
-	if !ok || req.Run != run.Name || req.Reason != "prompt_input_exit" {
-		t.Fatalf("close request %+v", req)
+	if reqs := rec.store.CloseRequestsFor(sid, run.Name); len(reqs) != 1 || reqs[0].Reason != "prompt_input_exit" {
+		t.Fatalf("close requests %+v", reqs)
 	}
 	close(release)
 	if err := finalizeLocked(t, rec, sid); err != nil {
@@ -275,13 +274,13 @@ func TestSessionEnd_DoesNotWaitForTheSigningLock(t *testing.T) {
 	if !run.Closed || end.Step["detail"] != "session ended: prompt_input_exit" {
 		t.Fatalf("closed=%v run_end %v", run.Closed, end.Step)
 	}
-	if _, ok := rec.store.CloseRequestFor(sid); ok {
+	if rec.store.CloseRequestedForKey(state.SessionKey(sid)) {
 		t.Fatal("the applied request is removed")
 	}
 }
 
 // R3-4: a hook killed while waiting for the lock must not matter: the request is written before anything
-// waits. A close request for another (older) run is stale and never closes the current one.
+// waits. A close request for another run never closes the current one, and stays for the run it names.
 func TestCloseRequest_IsRunBound(t *testing.T) {
 	fake := &fakeSigill{}
 	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
@@ -289,7 +288,7 @@ func TestCloseRequest_IsRunBound(t *testing.T) {
 	rec := newRec(t, srv.URL, nil)
 	sid := "f4000000-0000-4000-8000-000000000002"
 	mustHook(t, rec, input{SessionID: sid, HookEventName: "SessionStart", Source: "startup", Cwd: t.TempDir()})
-	if err := rec.store.RequestClose(sid, "20200101T000000Z-deadbeef", "other"); err != nil {
+	if err := rec.store.RequestClose(sid, "20200101T000000Z-deadbeef", 0, "other"); err != nil {
 		t.Fatal(err)
 	}
 	mustHook(t, rec, input{SessionID: sid, HookEventName: "Stop", LastAssistantMessage: "x"})
@@ -297,8 +296,8 @@ func TestCloseRequest_IsRunBound(t *testing.T) {
 	if run.CloseRequested != "" || run.Closed {
 		t.Fatal("a request for another run never closes this one")
 	}
-	if _, ok := rec.store.CloseRequestFor(sid); ok {
-		t.Fatal("a stale request is dropped")
+	if got := rec.store.PendingCloseRuns(sid); len(got) != 1 || got[0] != "20200101T000000Z-deadbeef" {
+		t.Fatalf("the other run's request stays pending for it: %v", got)
 	}
 }
 

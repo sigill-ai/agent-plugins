@@ -378,6 +378,9 @@ func (m *Manager) AccessToken(ctx context.Context, issuer string) (string, *Cred
 		return cred.AccessToken, cred, nil
 	}
 	err = m.withLock(ctx, func() error {
+		if err := m.migrate(); err != nil {
+			return err
+		}
 		cur, err := m.load() // another hook may have refreshed meanwhile
 		if err != nil || cur == nil {
 			return ErrNotConnected
@@ -479,6 +482,14 @@ func (m *Manager) load() (*Credential, error) {
 		return nil, err
 	}
 	return &c, nil
+}
+
+// migrate adopts an unambiguous pre-marker store (see authority.Migrate). Only under the credential lock.
+func (m *Manager) migrate() error {
+	if mg, ok := m.Store.(interface{ Migrate() error }); ok {
+		return mg.Migrate()
+	}
+	return nil
 }
 
 func (m *Manager) inFlightPath() string { return filepath.Join(m.Dir, "refresh.inflight") }

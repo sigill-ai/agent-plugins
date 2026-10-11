@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math/rand/v2"
 	"os"
 	"os/exec"
@@ -305,6 +306,13 @@ func (r *recorder) handle(ctx context.Context, in input) (*state.Run, error) {
 		}
 		if in.HookEventName == "SessionStart" {
 			return run, nil
+		}
+	} else if in.HookEventName == "SessionStart" {
+		// A resumed session continues this run: a session end read before now belongs to an earlier
+		// epoch and must never close it.
+		run.Resumes++
+		if err := r.store.Save(run); err != nil {
+			return run, err
 		}
 	}
 
@@ -796,26 +804,23 @@ func (r *recorder) sweep(ctx context.Context, self string) {
 			continue
 		}
 		run, err := r.store.CurrentForKey(key)
-		if err != nil || run == nil || run.Closed || run.Broken != "" ||
-			(run.CloseRequested == "" && !r.store.CloseRequestedForKey(key)) ||
-			(run.Account != "" && run.Account != r.account) {
+		if err != nil || run == nil {
+			continue
+		}
+		ours := func(x *state.Run) bool { return x.Account == "" || x.Account == r.account }
+		due := !run.Closed && run.Broken == "" && run.CloseRequested != "" && ours(run)
+		for _, name := range r.store.PendingCloseRunsForKey(key) {
+			// Requests for another account's runs stay for that account and never make a session a candidate.
+			if x, err := r.store.LoadRun(run.SessionID, name); err != nil || ours(x) {
+				due = true
+			}
+		}
+		if !due {
 			continue
 		}
 		_ = r.store.WithLock(ctx, run.SessionID, func() error {
-			cur, err := r.store.Current(run.SessionID)
-			if err != nil || cur == nil || cur.Name != run.Name {
-				return err
-			}
-			if err := r.recover(cur); err != nil {
-				return err
-			}
-			if err := r.applyCloseRequest(cur); err != nil {
-				return err
-			}
-			if cur.Closed || cur.Broken != "" || cur.CloseRequested == "" {
-				return nil
-			}
-			return r.finalize(ctx, cur)
+			_, err := r.finishSession(ctx, run.SessionID)
+			return err
 		})
 		return
 	}
@@ -845,28 +850,87 @@ func requestClose(ctx context.Context, store state.Store, in input) bool {
 	if reason == "" {
 		reason = "other"
 	}
-	if err := store.RequestClose(in.SessionID, run.Name, reason); err != nil {
+	if err := store.RequestClose(in.SessionID, run.Name, run.Resumes, reason); err != nil {
 		logf(store, "session %s event SessionEnd: %v", state.SessionKey(in.SessionID), err)
 		return false
 	}
 	return true
 }
 
-// applyCloseRequest turns a lock-free close request into the run's CloseRequested, under the session lock.
-// The run state is saved before the request is removed, so a crash in between only applies it twice.
+// applyCloseRequest turns this run's lock-free close requests into its CloseRequested, under the session
+// lock. Only requests naming this run and its current resume epoch apply; requests for other runs are left
+// for those runs. The run state is saved before the requests are removed, so a crash in between only
+// applies them twice, and only the requests read here are removed.
 func (r *recorder) applyCloseRequest(run *state.Run) error {
-	req, ok := r.store.CloseRequestFor(run.SessionID)
-	if !ok {
+	reqs := r.store.CloseRequestsFor(run.SessionID, run.Name)
+	if len(reqs) == 0 {
 		return nil
 	}
-	if req.Run == run.Name && !run.Closed && run.Broken == "" && run.CloseRequested == "" {
-		run.CloseRequested = req.Reason
-		if err := r.store.Save(run); err != nil {
-			return err
+	if !run.Closed && run.Broken == "" && run.CloseRequested == "" {
+		for _, q := range reqs {
+			if q.Resumes == run.Resumes {
+				run.CloseRequested = q.Reason
+				break
+			}
+		}
+		if run.CloseRequested != "" {
+			if err := r.store.Save(run); err != nil {
+				return err
+			}
 		}
 	}
-	r.store.ClearCloseRequest(run.SessionID)
+	for _, q := range reqs {
+		r.store.ClearCloseRequest(q)
+	}
 	return nil
+}
+
+// finishSession, under the session lock, applies every pending close request of the session to the run
+// it names (current or not) and seals run_end where one is due. It returns the current run.
+func (r *recorder) finishSession(ctx context.Context, session string) (*state.Run, error) {
+	cur, err := r.store.Current(session)
+	if err != nil {
+		return nil, err
+	}
+	var errs []error
+	for _, name := range r.store.PendingCloseRuns(session) {
+		if cur != nil && name == cur.Name {
+			continue
+		}
+		run, err := r.store.LoadRun(session, name)
+		if errors.Is(err, fs.ErrNotExist) {
+			logf(r.store, "session %s: close request for unknown run %s dropped", state.SessionKey(session), name)
+			for _, q := range r.store.CloseRequestsFor(session, name) {
+				r.store.ClearCloseRequest(q)
+			}
+			continue
+		}
+		if err != nil {
+			errs = append(errs, err) // the request stays for a later attempt
+			continue
+		}
+		errs = append(errs, r.finishRun(ctx, run))
+	}
+	if cur != nil {
+		errs = append(errs, r.finishRun(ctx, cur))
+	}
+	return cur, errors.Join(errs...)
+}
+
+func (r *recorder) finishRun(ctx context.Context, run *state.Run) error {
+	if run.Account != "" && run.Account != r.account {
+		return nil // never finalized under another identity; its requests stay
+	}
+	if err := r.recover(run); err != nil {
+		return err
+	}
+	if err := r.applyCloseRequest(run); err != nil {
+		return err
+	}
+	if run.CloseRequested == "" || run.Closed || run.Broken != "" {
+		return nil
+	}
+	return r.finalize(ctx, run)
 }
 
 // spawn starts the detached finalizer (a variable so tests can observe it).
@@ -903,21 +967,11 @@ func cmdFinalize(args []string) int {
 	rec := &recorder{cfg: cfg, store: store, be: be, account: account}
 	var run *state.Run
 	err = store.WithLock(ctx, args[0], func() error {
-		cur, err := store.Current(args[0])
-		if err != nil || cur == nil || (cur.Account != "" && cur.Account != account) {
-			return err
+		cur, err := rec.finishSession(ctx, args[0])
+		if cur != nil && (cur.Account == "" || cur.Account == account) {
+			run = cur
 		}
-		run = cur
-		if err := rec.recover(cur); err != nil {
-			return err
-		}
-		if err := rec.applyCloseRequest(cur); err != nil {
-			return err
-		}
-		if cur.CloseRequested == "" || cur.Closed || cur.Broken != "" {
-			return nil
-		}
-		return rec.finalize(ctx, cur)
+		return err
 	})
 	if err != nil {
 		logf(store, "finalize %s: %v", state.SessionKey(args[0]), err)
@@ -1187,8 +1241,8 @@ func cmdStatus() int {
 		certText(cfg.CertificateID), cfg.AgentID, cfg.DataDir, cfg.FailClosed, cfg.Index, cfg.Qualified)
 	store := state.Store{Dir: cfg.DataDir}
 	for _, key := range store.SessionKeys() {
-		if store.CloseRequestedForKey(key) {
-			fmt.Printf("session %s: ended, run_end not sealed yet (the finalizer or next session start finishes it)\n", key[:8])
+		for _, name := range store.PendingCloseRunsForKey(key) {
+			fmt.Printf("run %s: session ended, run_end not sealed yet (the finalizer or next session start finishes it)\n", name)
 		}
 		for _, run := range store.RunsForKey(key) {
 			switch {

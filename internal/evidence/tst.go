@@ -1,18 +1,26 @@
 package evidence
 
-// A structural check of RFC 3161 timestamp tokens — NOT TSA verification. It establishes that the token is
-// a well-formed CMS SignedData (RFC 5652) with at least one SignerInfo carrying its mandatory fields, that it
-// encapsulates a DER-encoded TSTInfo (RFC 3161 §2.4.2) with every mandatory field, and that the TSTInfo's own
-// messageImprint is bound to the signature being checked. The outer CMS may be BER (indefinite lengths,
-// constructed OCTET STRINGs). Whether the TSA's signature is valid and its certificate trusted is decided by
-// verifiers (Sigill's verify-objects, the SDKs), never here.
+// A structural and value check of RFC 3161 timestamp tokens — NOT TSA verification. It establishes that the
+// token is a well-formed CMS SignedData (RFC 5652) with at least one SignerInfo carrying its mandatory fields,
+// that it encapsulates a DER-framed TSTInfo (RFC 3161 §2.4.2: definite minimal lengths, primitive strings)
+// whose mandatory fields decode (encoding/asn1) to valid values — version 1, a policy OID, a messageImprint of
+// a supported hash with a matching length, a minimally encoded serialNumber, a UTC genTime of the RFC 3161
+// form — and that the TSTInfo's own messageImprint is bound to the signature being checked. The outer CMS may
+// be BER (indefinite lengths, constructed OCTET STRINGs). Whether the TSA's signature is valid and its
+// certificate trusted is decided by verifiers (Sigill's verify-objects, the SDKs), never here.
 
 import (
 	"bytes"
 	"crypto/sha256"
 	"crypto/sha512"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"errors"
+	"fmt"
 	"hash"
+	"math/big"
+	"strings"
+	"time"
 )
 
 type tlv struct {
@@ -117,9 +125,6 @@ func oidIs(t tlv, der []byte) bool {
 var (
 	oidSignedData = []byte{0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02}             // 1.2.840.113549.1.7.2
 	oidTSTInfo    = []byte{0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x10, 0x01, 0x04} // 1.2.840.113549.1.9.16.1.4
-	oidSHA256     = []byte{0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01}             // 2.16.840.1.101.3.4.2.1
-	oidSHA384     = []byte{0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02}
-	oidSHA512     = []byte{0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03}
 )
 
 // tokenImprint parses a timestamp token (CMS ContentInfo with SignedData over a TSTInfo) and returns the hash
@@ -166,36 +171,32 @@ func tokenImprint(token []byte) (func() hash.Hash, []byte, error) {
 	if !isDER(info, 0) {
 		return nil, nil, errors.New("the TSTInfo is not DER-encoded (RFC 3161 §2.4.2)")
 	}
-	tst, rest, err := readTLV(info, 5)
-	if err != nil || len(rest) != 0 || !universal(tst, 16) {
-		return nil, nil, errors.New("the TSTInfo is malformed")
+	var tst tstInfo
+	if rest, err := asn1.Unmarshal(info, &tst); err != nil || len(rest) != 0 {
+		return nil, nil, fmt.Errorf("the TSTInfo is malformed or lacks a mandatory field (version, policy, messageImprint, serialNumber, genTime): %v", err)
 	}
-	// TSTInfo ::= SEQUENCE { version INTEGER, policy OID, messageImprint, serialNumber INTEGER,
-	//                        genTime GeneralizedTime, accuracy, ordering, nonce, tsa, extensions (optional) }
-	fields, err := children(tst, 6)
-	if err != nil || len(fields) < 5 || !universal(fields[0], 2) || !universal(fields[1], 6) || !universal(fields[2], 16) ||
-		!universal(fields[3], 2) || !universal(fields[4], 24) {
-		return nil, nil, errors.New("the TSTInfo lacks a mandatory field (version, policy, messageImprint, serialNumber, genTime)")
+	if tst.Version != 1 {
+		return nil, nil, fmt.Errorf("the TSTInfo version is %d, not 1", tst.Version)
 	}
-	mi, err := children(fields[2], 7)
-	if err != nil || len(mi) != 2 || !universal(mi[0], 16) {
-		return nil, nil, errors.New("the TSTInfo's messageImprint is malformed")
+	if len(tst.Policy) < 2 {
+		return nil, nil, errors.New("the TSTInfo's policy is not a valid OID")
 	}
-	alg, err := children(mi[0], 8)
-	if err != nil || len(alg) == 0 {
-		return nil, nil, errors.New("the messageImprint's hashAlgorithm is malformed")
+	if tst.SerialNumber == nil {
+		return nil, nil, errors.New("the TSTInfo's serialNumber is malformed")
 	}
-	hashed, err := octets(mi[1], 8)
-	if err != nil {
-		return nil, nil, errors.New("the messageImprint's hashedMessage is malformed")
+	if tst.GenTime.Class != asn1.ClassUniversal || tst.GenTime.Tag != asn1.TagGeneralizedTime || tst.GenTime.IsCompound ||
+		!validGenTime(tst.GenTime.Bytes) {
+		return nil, nil, errors.New("the TSTInfo's genTime is not a valid UTC GeneralizedTime (RFC 3161 §2.4.2)")
 	}
+	hashed := tst.MessageImprint.HashedMessage
+	alg := tst.MessageImprint.HashAlgorithm.Algorithm
 	var h func() hash.Hash
 	switch {
-	case oidIs(alg[0], oidSHA256):
+	case alg.Equal(asn1OIDSHA256):
 		h = sha256.New
-	case oidIs(alg[0], oidSHA384):
+	case alg.Equal(asn1OIDSHA384):
 		h = sha512.New384
-	case oidIs(alg[0], oidSHA512):
+	case alg.Equal(asn1OIDSHA512):
 		h = sha512.New
 	default:
 		return nil, nil, errors.New("the messageImprint uses an unsupported hash algorithm")
@@ -204,6 +205,54 @@ func tokenImprint(token []byte) (func() hash.Hash, []byte, error) {
 		return nil, nil, errors.New("the messageImprint's length does not match its hash algorithm")
 	}
 	return h, hashed, nil
+}
+
+// TSTInfo ::= SEQUENCE { version INTEGER { v1(1) }, policy TSAPolicyId, messageImprint MessageImprint,
+// serialNumber INTEGER, genTime GeneralizedTime, accuracy, ordering, nonce, tsa, extensions (all optional) }.
+// encoding/asn1 rejects empty or non-minimal INTEGERs, malformed OIDs and constructed OCTET STRINGs; the
+// optional trailing fields are not interpreted here.
+type tstInfo struct {
+	Version        int
+	Policy         asn1.ObjectIdentifier
+	MessageImprint struct {
+		HashAlgorithm pkix.AlgorithmIdentifier
+		HashedMessage []byte
+	}
+	SerialNumber *big.Int
+	GenTime      asn1.RawValue // validated by validGenTime: encoding/asn1 would also accept offsets
+}
+
+var (
+	asn1OIDSHA256 = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 1}
+	asn1OIDSHA384 = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 2}
+	asn1OIDSHA512 = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 3}
+)
+
+// validGenTime: RFC 3161 §2.4.2 genTime — YYYYMMDDhhmmss[.s+]Z in UTC, a valid calendar time, fractional
+// seconds without trailing zeros (and no lone "."), no other characters.
+func validGenTime(b []byte) bool {
+	s := string(b)
+	if len(s) < 15 || s[len(s)-1] != 'Z' {
+		return false
+	}
+	body, frac, hasFrac := strings.Cut(s[:len(s)-1], ".")
+	if hasFrac && (frac == "" || strings.HasSuffix(frac, "0")) {
+		return false
+	}
+	if len(body) != 14 || !digits(body) || !digits(frac) {
+		return false
+	}
+	_, err := time.Parse("20060102150405", body)
+	return err == nil
+}
+
+func digits(s string) bool {
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // checkSignerInfos requires signerInfos ::= SET OF SignerInfo with at least one SignerInfo carrying its

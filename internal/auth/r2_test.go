@@ -88,12 +88,17 @@ type memStore struct {
 	failSet bool
 	failGet bool
 	failDel bool
+	onGet   func() // runs once, inside the next Get (interleavings)
 }
 
 func (s *memStore) Name() string { return "mem" }
 func (s *memStore) Get() ([]byte, error) {
+	if f := s.onGet; f != nil {
+		s.onGet = nil
+		f()
+	}
 	if s.failGet {
-		return nil, nil
+		return nil, errors.New("keychain locked")
 	}
 	return s.val, nil
 }
@@ -198,10 +203,11 @@ func TestAuthority_AcrossInvocationsAndModeSwitches(t *testing.T) {
 	}
 }
 
-// R3-3: stores written before markers existed are adopted only when unambiguous.
+// R3-3: stores written before markers existed are used only when unambiguous, and adopted (marker written)
+// only by Migrate.
 func TestAuthority_LegacyStatesAreNeverGuessed(t *testing.T) {
-	mk := func(primary SecretStore, fileOnly bool, dir string) *authority {
-		return &authority{primary: primary, osPrimary: "keychain", fileOnly: fileOnly,
+	mk := func(primary SecretStore, readOnly bool, dir string) *authority {
+		return &authority{primary: primary, osPrimary: "keychain", readOnlyPrimary: readOnly,
 			file: &FileStore{Path: filepath.Join(dir, "credential.json")}, marker: filepath.Join(dir, "credential.store")}
 	}
 	// R0 in the keychain, a newer R1 in the file (0.1/0.2.0 fell back to the file when the keychain failed).
@@ -216,19 +222,32 @@ func TestAuthority_LegacyStatesAreNeverGuessed(t *testing.T) {
 	if _, err := mk(nil, false, dir).Get(); !errors.Is(err, ErrCredentialAmbiguous) {
 		t.Fatalf("an unreadable keychain must make a legacy file ambiguous, got %v", err)
 	}
-	// File-only by choice: the file is adopted and becomes authoritative.
-	if got, err := mk(nil, true, dir).Get(); err != nil || string(got) != "R1" {
-		t.Fatalf("file-only adoption got %q (%v)", got, err)
+	// File-only by choice is no proof either; a keychain read that finds nothing is.
+	if _, err := mk(nil, true, dir).Get(); !errors.Is(err, ErrCredentialAmbiguous) {
+		t.Fatalf("file-only mode must not adopt a legacy file it cannot rule out, got %v", err)
+	}
+	a := mk(&memStore{}, true, dir)
+	if got, err := a.Get(); err != nil || string(got) != "R1" {
+		t.Fatalf("file with a provably empty keychain got %q (%v)", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "credential.store")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("an ordinary Get never writes the marker")
+	}
+	if err := a.Migrate(); err != nil {
+		t.Fatal(err)
 	}
 	raw, _ := os.ReadFile(filepath.Join(dir, "credential.store"))
 	if !strings.Contains(string(raw), `"file"`) {
 		t.Fatalf("marker %s", raw)
 	}
-	// Only the keychain holds it: adopted, marker written, and the same in the next invocation.
+	// Only the keychain holds it: used, adopted by Migrate, and the same in the next invocation.
 	dir = t.TempDir()
 	mem := &memStore{val: []byte("R2")}
 	if got, err := mk(mem, false, dir).Get(); err != nil || string(got) != "R2" {
-		t.Fatalf("keychain adoption got %q (%v)", got, err)
+		t.Fatalf("keychain legacy read got %q (%v)", got, err)
+	}
+	if err := mk(mem, false, dir).Migrate(); err != nil {
+		t.Fatal(err)
 	}
 	if got, err := mk(mem, false, dir).Get(); err != nil || string(got) != "R2" {
 		t.Fatalf("next invocation got %q (%v)", got, err)

@@ -17,6 +17,7 @@ package state
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -79,6 +80,9 @@ type Run struct {
 	// FidelityIssue records a known capture-fidelity problem of this run (e.g. a contradicted sub-agent
 	// pairing). Such a run never closes "completed": it closes "aborted" with this as its detail.
 	FidelityIssue string `json:"fidelityIssue,omitempty"`
+	// Resumes counts the times a resumed session continued this run. A close request carries the epoch it
+	// was made in, so a session end read before a resume never closes the resumed run.
+	Resumes int `json:"resumes,omitempty"`
 }
 
 // Delegation is one sub-agent this run started.
@@ -370,57 +374,118 @@ func (s Store) RunsForKey(key string) []*Run {
 }
 
 // CloseRequest is a session end recorded WITHOUT the session lock (SessionEnd must not wait for a lock a
-// sealing hook may hold longer than Claude Code lets SessionEnd live). It names the run that was current;
-// the finalizer, a sweep or the next hook applies it under the lock.
+// sealing hook may hold longer than Claude Code lets SessionEnd live). It names the run that was current
+// and that run's resume epoch; the finalizer, a sweep or the next hook applies it under the lock.
+//
+// Every request is its own immutable file, named after its run plus a random suffix: a producer never
+// replaces a request, and a consumer removes exactly the requests it read (File), never one published after.
 type CloseRequest struct {
-	Run    string    `json:"run"`
-	Reason string    `json:"reason"`
-	At     time.Time `json:"at"`
+	Run     string    `json:"run"`
+	Resumes int       `json:"resumes"` // the run's Resumes when the session ended; an older epoch is stale
+	Reason  string    `json:"reason"`
+	At      time.Time `json:"at"`
+	File    string    `json:"-"`
 }
 
-const closeRequestFile = "close-request"
+const closeRequestDir = "close-requests"
 
-// RequestClose durably records that the session ended on run (atomic write, no lock).
-func (s Store) RequestClose(session, run, reason string) error {
+// validRunName: a run name that is safe as a path element and in a close-request file name.
+func validRunName(name string) bool {
+	return name != "" && name == filepath.Base(name) && !strings.HasPrefix(name, ".") && !strings.Contains(name, ".")
+}
+
+// RequestClose durably records that the session ended on run at resume epoch resumes (atomic, no lock).
+func (s Store) RequestClose(session, run string, resumes int, reason string) error {
+	if !validRunName(run) {
+		return fmt.Errorf("invalid run name %q", run)
+	}
 	if err := s.ensureRoot(); err != nil {
 		return err
 	}
-	dir, err := mkdirPrivate(s.Dir, "sessions", SessionKey(session))
+	dir, err := mkdirPrivate(s.Dir, "sessions", SessionKey(session), closeRequestDir)
 	if err != nil {
 		return err
 	}
-	raw, _ := json.Marshal(CloseRequest{Run: run, Reason: reason, At: time.Now().UTC()})
-	if err := writeAtomic(dir, closeRequestFile, raw); err != nil {
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return err
+	}
+	raw, _ := json.Marshal(CloseRequest{Run: run, Resumes: resumes, Reason: reason, At: time.Now().UTC()})
+	if err := writeAtomic(dir, run+"."+hex.EncodeToString(nonce[:]), raw); err != nil {
 		return err
 	}
 	return syncDir(dir)
 }
 
-// CloseRequestFor reads the session's recorded close request, if any.
-func (s Store) CloseRequestFor(session string) (*CloseRequest, bool) {
-	raw, err := readRegular(filepath.Join(s.sessionDir(session), closeRequestFile), 4096)
-	if err != nil {
-		return nil, false
+// closeRequestsIn lists the requests in dir, oldest first; for one run when run != "".
+func closeRequestsIn(dir, run string) []*CloseRequest {
+	entries, _ := os.ReadDir(dir)
+	reqs := []*CloseRequest{}
+	for _, e := range entries {
+		name, nonce, ok := strings.Cut(e.Name(), ".")
+		if !ok || !validRunName(name) || len(nonce) != 16 || strings.Contains(nonce, ".") || (run != "" && name != run) {
+			continue // temp files start with "."; anything else is not a request
+		}
+		p := filepath.Join(dir, e.Name())
+		raw, err := readRegular(p, 4096)
+		if err != nil {
+			continue
+		}
+		var c CloseRequest
+		if json.Unmarshal(raw, &c) != nil || c.Run != name {
+			continue
+		}
+		c.File = p
+		reqs = append(reqs, &c)
 	}
-	var c CloseRequest
-	if json.Unmarshal(raw, &c) != nil || c.Run == "" {
-		return nil, false
+	sort.Slice(reqs, func(i, j int) bool { return reqs[i].At.Before(reqs[j].At) })
+	return reqs
+}
+
+// CloseRequestsFor reads the session's unapplied close requests for run, oldest first.
+func (s Store) CloseRequestsFor(session, run string) []*CloseRequest {
+	if !validRunName(run) {
+		return nil
 	}
-	return &c, true
+	return closeRequestsIn(filepath.Join(s.sessionDir(session), closeRequestDir), run)
+}
+
+// PendingCloseRuns lists the runs of the session that have unapplied close requests.
+func (s Store) PendingCloseRuns(session string) []string {
+	return pendingRuns(filepath.Join(s.sessionDir(session), closeRequestDir))
+}
+
+// PendingCloseRunsForKey: PendingCloseRuns for the session stored under key (sweeps, status).
+func (s Store) PendingCloseRunsForKey(key string) []string {
+	if key != filepath.Base(key) || strings.HasPrefix(key, ".") {
+		return nil
+	}
+	return pendingRuns(filepath.Join(s.Dir, "sessions", key, closeRequestDir))
+}
+
+func pendingRuns(dir string) []string {
+	seen := map[string]bool{}
+	names := []string{}
+	for _, c := range closeRequestsIn(dir, "") {
+		if !seen[c.Run] {
+			seen[c.Run] = true
+			names = append(names, c.Run)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 // CloseRequestedForKey reports whether the session stored under key has an unapplied close request.
-func (s Store) CloseRequestedForKey(key string) bool {
-	if key != filepath.Base(key) || strings.HasPrefix(key, ".") {
-		return false
-	}
-	_, err := os.Lstat(filepath.Join(s.Dir, "sessions", key, closeRequestFile))
-	return err == nil
-}
+func (s Store) CloseRequestedForKey(key string) bool { return len(s.PendingCloseRunsForKey(key)) > 0 }
 
-// ClearCloseRequest removes the session's close request once it has been applied (or is stale).
-func (s Store) ClearCloseRequest(session string) {
-	_ = os.Remove(filepath.Join(s.sessionDir(session), closeRequestFile))
+// ClearCloseRequest removes exactly this request, once applied (or found stale). A request published
+// after it was read is a different file and stays.
+func (s Store) ClearCloseRequest(req *CloseRequest) {
+	if req == nil || req.File == "" {
+		return
+	}
+	_ = os.Remove(req.File)
 }
 
 // syncDir makes a rename in dir durable across a machine crash (the file data itself is synced first).

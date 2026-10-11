@@ -131,8 +131,9 @@ and verify it at [sigill.ai/verify-run](https://sigill.ai/verify-run).
 ## Robustness
 
 - A required timestamp is checked before a step counts as recorded: the seal must carry a well-formed
-  RFC 3161 token whose own message imprint is bound to the seal's signature. (This is a structural check;
-  the TSA's signature is verified by verifiers, e.g. sigill.ai/verify-run.)
+  RFC 3161 token whose own message imprint is bound to the seal's signature, and whose mandatory TSTInfo
+  values (version, policy, serial number, UTC genTime) are valid. (This is a structural check; the TSA's
+  signature is verified by verifiers, e.g. sigill.ai/verify-run.)
 - With `SIGILL_FAIL_CLOSED=1`, a consequential tool (including `Agent` when listed in
   `SIGILL_CONSEQUENTIAL_TOOLS`) runs only if this hook durably sealed its step.
 - A sub-agent is bound to its own run only when the pairing is unambiguous. If Claude Code later reports a
@@ -140,10 +141,13 @@ and verify it at [sigill.ai/verify-run](https://sigill.ai/verify-run).
   sub-agent of the session is bound, and the run closes `aborted` with that detail.
 - If a step's seal fails or comes back without a valid timestamp, the run stops: nothing more is sealed
   into it, and its close is never reported as `completed`.
-- Session end never waits for the signing lock: it writes a close request bound to the current run, which
-  the next hook, the background finalizer or a later sweep applies.
+- Session end never waits for the signing lock: it writes its own close request, bound to the run that was
+  current and to that run's resume count. The next hook, the background finalizer or a later sweep applies
+  it to that run only; a session end read before a resume never closes the resumed run.
 - An interrupted token refresh is never replayed: it requires `/sigill:connect` instead. The credential
-  store records which backend holds the credential; ambiguous older state also requires `/sigill:connect`.
+  store records which backend holds the credential. A store that cannot be read (for example a locked
+  keychain) is never treated as empty, and older state that is ambiguous or cannot be fully read requires
+  `/sigill:connect`.
 - Local state is written atomically and fsynced (file and directory). This survives a process crash; after
   power loss the drive's own cache may still lose the last write (macOS `fsync` does not flush it).
 - Sign-in uses Sigill's MCP endpoint, which is stateless: each hook calls `tools/call` directly, without an

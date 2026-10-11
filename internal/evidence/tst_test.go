@@ -1,6 +1,7 @@
 package evidence
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/base64"
@@ -91,9 +92,9 @@ func TestTimestamp_IndefiniteLengthBERPasses(t *testing.T) {
 func TestTimestamp_TruncatedStructuresFail(t *testing.T) {
 	s := sha512.Sum512([]byte(sig))
 	for name, opts := range map[string]evidencetest.Options{
-		"no signerInfos":   {NoSignerInfos: true},
-		"no serialNumber":  {OmitSerial: true},
-		"no genTime":       {OmitGenTime: true},
+		"no signerInfos":     {NoSignerInfos: true},
+		"no serialNumber":    {OmitSerial: true},
+		"no genTime":         {OmitGenTime: true},
 		"BER inside TSTInfo": {BERTSTInfo: true},
 	} {
 		if err := CheckSignatureTimestamp(sealWith(sig, evidencetest.TokenWith(evidencetest.OIDSHA512, s[:], opts))); err == nil {
@@ -102,5 +103,48 @@ func TestTimestamp_TruncatedStructuresFail(t *testing.T) {
 	}
 	if err := CheckSignatureTimestamp(sealWith(sig, evidencetest.TokenWith(evidencetest.OIDSHA512, s[:], evidencetest.Options{}))); err != nil {
 		t.Fatalf("the complete token must pass: %v", err)
+	}
+}
+
+// R4-3 (Codex round 4 repro, ported): a GeneralizedTime tag with invalid characters is not a genTime.
+func TestTimestamp_InvalidGeneralizedTimeFails(t *testing.T) {
+	token := evidencetest.ForSignature(sig)
+	bad := bytes.Replace(token, []byte("20261011000000Z"), []byte("XXXXXXXXXXXXXXZ"), 1)
+	if bytes.Equal(token, bad) {
+		t.Fatal("fixture mutation did not occur")
+	}
+	if err := CheckSignatureTimestamp(sealWith(sig, bad)); err == nil {
+		t.Fatal("invalid mandatory genTime accepted")
+	}
+}
+
+// R4-3: the TSTInfo's mandatory values are decoded and checked, not only its tags.
+func TestTimestamp_InvalidTSTInfoValuesFail(t *testing.T) {
+	s := sha512.Sum512([]byte(sig))
+	for name, opts := range map[string]evidencetest.Options{
+		"version 2":                      {Version: 2},
+		"version 3":                      {Version: 3},
+		"empty serialNumber":             {SerialContent: []byte{}},
+		"non-minimal serialNumber":       {SerialContent: []byte{0x00, 0x01}},
+		"non-minimal negative serial":    {SerialContent: []byte{0xff, 0x80}},
+		"genTime with an offset":         {GenTime: "20261011000000+0100"},
+		"genTime without a zone":         {GenTime: "20261011000000"},
+		"genTime local, no Z":            {GenTime: "202610110000000"},
+		"genTime month 13":               {GenTime: "20261311000000Z"},
+		"genTime trailing fraction zero": {GenTime: "20261011000000.50Z"},
+		"genTime lone fraction dot":      {GenTime: "20261011000000.Z"},
+		"genTime short":                  {GenTime: "202610110000Z"},
+	} {
+		if err := CheckSignatureTimestamp(sealWith(sig, evidencetest.TokenWith(evidencetest.OIDSHA512, s[:], opts))); err == nil {
+			t.Errorf("%s: must fail", name)
+		}
+	}
+	for name, opts := range map[string]evidencetest.Options{
+		"fractional genTime": {GenTime: "20261011000000.123Z"},
+		"multi-octet serial": {SerialContent: []byte{0x00, 0x80}},
+	} {
+		if err := CheckSignatureTimestamp(sealWith(sig, evidencetest.TokenWith(evidencetest.OIDSHA512, s[:], opts))); err != nil {
+			t.Errorf("%s: must pass: %v", name, err)
+		}
 	}
 }

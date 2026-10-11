@@ -29,24 +29,23 @@ const (
 // DefaultStore returns the installation's credential store. Every mode — OS keychain, Secret Service,
 // private file only (SIGILL_CREDENTIAL_STORE=file, or no keychain usable in this invocation) — goes through
 // one authority protocol (see authority), so switching between them can never read a stale copy.
+//
+// Which OS store this installation could have used depends only on the OS, never on whether its helper is
+// on PATH now: a helper that disappeared makes that store unreadable (uncertain), not absent.
 func DefaultStore(dir string) SecretStore {
 	a := &authority{file: &FileStore{Path: filepath.Join(dir, "credential.json")}, marker: filepath.Join(dir, "credential.store")}
 	switch runtime.GOOS {
 	case "darwin":
-		a.osPrimary = "keychain"
-		if _, err := exec.LookPath("security"); err == nil {
-			a.primary = &macKeychain{account: "default:" + dir} // one credential per plugin data directory
-		}
+		a.osPrimary, a.primary = "keychain", &macKeychain{account: "default:" + dir} // one credential per data directory
+		_, err := exec.LookPath("security")
+		a.readOnlyPrimary = err != nil
 	case "linux":
-		if _, err := exec.LookPath("secret-tool"); err == nil {
-			a.osPrimary = "secret-service"
-			if os.Getenv("DBUS_SESSION_BUS_ADDRESS") != "" {
-				a.primary = &secretService{account: "default:" + dir}
-			}
-		}
+		a.osPrimary, a.primary = "secret-service", &secretService{account: "default:" + dir}
+		_, err := exec.LookPath("secret-tool")
+		a.readOnlyPrimary = err != nil || os.Getenv("DBUS_SESSION_BUS_ADDRESS") == ""
 	}
 	if os.Getenv("SIGILL_CREDENTIAL_STORE") == "file" {
-		a.primary, a.fileOnly = nil, true
+		a.readOnlyPrimary = true // never written; still read where the marker names it, or to rule out a newer legacy copy
 	}
 	return a
 }
@@ -61,14 +60,18 @@ var ErrCredentialAmbiguous = errors.New("the stored Sigill connection cannot be 
 // superseded secret left anywhere else (a spent refresh token in a keychain that was briefly unavailable, a
 // file left from a headless run) is never read. Set writes the new secret, then flips the marker; a crash in
 // between leaves the previous consistent state (and the refresh protocol's in-flight marker makes it
-// uncertain, never replayed). Delete writes the tombstone first. Stores written before markers existed are
-// adopted only when unambiguous; otherwise the user reconnects.
+// uncertain, never replayed). Delete writes the tombstone first.
+//
+// Stores written before markers existed are used only when every possible backend was read successfully
+// and the result is unambiguous; a backend that could not be read (locked, helper missing) makes a legacy
+// copy elsewhere uncertain, and the user reconnects. Get never writes: adopting legacy state (writing the
+// marker) is Migrate, which runs only under the credential lock, where every marker writer is serialized.
 type authority struct {
-	primary   SecretStore // the OS store, nil when not usable in this invocation
-	osPrimary string      // "keychain" | "secret-service" | "" — what this OS could hold
-	fileOnly  bool        // SIGILL_CREDENTIAL_STORE=file: the file is the only store by choice
-	file      *FileStore
-	marker    string
+	primary         SecretStore // the OS store this installation could have used; nil when the OS has none
+	osPrimary       string      // "keychain" | "secret-service" | "" — its marker name
+	readOnlyPrimary bool        // never written in this invocation (helper missing, no session bus, or file-only)
+	file            *FileStore
+	marker          string
 }
 
 type storeMarker struct {
@@ -77,11 +80,13 @@ type storeMarker struct {
 }
 
 func (a *authority) Name() string {
-	if a.primary != nil {
+	if a.writable() {
 		return a.primary.Name() + " (file fallback)"
 	}
 	return "private file"
 }
+
+func (a *authority) writable() bool { return a.primary != nil && !a.readOnlyPrimary }
 
 func (a *authority) readMarker() (*storeMarker, error) {
 	raw, err := (&FileStore{Path: a.marker}).Get()
@@ -114,6 +119,7 @@ func (a *authority) primaryID() string {
 	return a.osPrimary
 }
 
+// Get reads the credential. It never writes (see Migrate).
 func (a *authority) Get() ([]byte, error) {
 	m, err := a.readMarker()
 	if err != nil {
@@ -126,40 +132,74 @@ func (a *authority) Get() ([]byte, error) {
 		case m.Backend == "file":
 			return a.file.Get()
 		case m.Backend == a.primaryID():
-			return a.primary.Get()
+			b, err := a.primary.Get()
+			if err != nil {
+				return nil, fmt.Errorf("the Sigill connection is stored in the %s, which cannot be read now: %w", m.Backend, err)
+			}
+			return b, nil
 		default:
 			return nil, fmt.Errorf("the Sigill connection is stored in the %s, which is not available now", m.Backend)
 		}
 	}
-	// No marker: written before markers existed (or never connected). Adopt only an unambiguous state.
-	var pb []byte
-	if a.primary != nil {
-		pb, _ = a.primary.Get()
-	}
+	b, _, err := a.legacy()
+	return b, err
+}
+
+// legacy resolves a store written before markers existed: the secret and the backend holding it, or nil
+// when nothing is stored. Any backend that could hold a newer copy but cannot be read makes a found copy
+// uncertain; two different copies are ambiguous. Read-only.
+func (a *authority) legacy() ([]byte, string, error) {
 	fb, err := a.file.Get()
 	if err != nil {
-		return nil, err
+		return nil, "", fmt.Errorf("%w: the credential file cannot be read (%v)", ErrCredentialAmbiguous, err)
+	}
+	var pb []byte
+	var perr error
+	switch {
+	case a.primary != nil:
+		pb, perr = a.primary.Get()
+	case a.osPrimary != "":
+		perr = errors.New("not available in this invocation")
+	}
+	if perr != nil {
+		if len(fb) == 0 {
+			return nil, "", nil // nothing usable is stored: not connected (connecting writes a fresh marker)
+		}
+		return nil, "", fmt.Errorf("%w: the %s, which may hold a newer copy, cannot be read (%v)", ErrCredentialAmbiguous, a.osPrimary, perr)
 	}
 	switch {
 	case len(pb) > 0 && len(fb) > 0:
 		if !bytes.Equal(pb, fb) {
-			return nil, ErrCredentialAmbiguous // two different secrets: never guess which is current
+			return nil, "", ErrCredentialAmbiguous // two different secrets: never guess which is current
 		}
-		if err := a.writeMarker(a.primaryID(), 1); err != nil {
-			return nil, err
-		}
-		_ = a.file.Delete()
-		return pb, nil
+		return pb, a.osPrimary, nil
 	case len(pb) > 0:
-		return pb, a.writeMarker(a.primaryID(), 1)
+		return pb, a.osPrimary, nil
 	case len(fb) > 0:
-		if a.primary == nil && a.osPrimary != "" && !a.fileOnly {
-			// The OS store this installation may have used cannot be read now; it could hold a newer secret.
-			return nil, ErrCredentialAmbiguous
-		}
-		return fb, a.writeMarker("file", 1)
+		return fb, "file", nil
 	}
-	return nil, nil
+	return nil, "", nil
+}
+
+// Migrate makes an unambiguous legacy store authoritative by writing its marker. It must run under the
+// credential lock: there every marker writer (Set, Delete, Migrate) is serialized, so a migration decided
+// on a stale read can never overwrite a marker written meanwhile. With a marker present it does nothing.
+func (a *authority) Migrate() error {
+	m, err := a.readMarker()
+	if err != nil || m != nil {
+		return err
+	}
+	b, backend, err := a.legacy()
+	if err != nil || b == nil {
+		return err
+	}
+	if err := a.writeMarker(backend, 1); err != nil {
+		return err
+	}
+	if backend != "file" {
+		_ = a.file.Delete() // unreadable under the marker anyway; removing it is housekeeping
+	}
+	return nil
 }
 
 func (a *authority) Set(b []byte) error {
@@ -168,7 +208,7 @@ func (a *authority) Set(b []byte) error {
 		gen = m.Generation
 	}
 	backend := "file"
-	if a.primary != nil && a.primary.Set(b) == nil {
+	if a.writable() && a.primary.Set(b) == nil {
 		backend = a.primaryID()
 	} else if err := a.file.Set(b); err != nil {
 		return err
@@ -178,7 +218,7 @@ func (a *authority) Set(b []byte) error {
 	}
 	// The other copy is unreadable under the marker anyway; removing it is housekeeping.
 	if backend == "file" {
-		if a.primary != nil {
+		if a.writable() {
 			_ = a.primary.Delete()
 		}
 	} else {
@@ -195,7 +235,7 @@ func (a *authority) Delete() error {
 	if err := a.writeMarker("none", gen+1); err != nil { // the tombstone first: nothing can be resurrected
 		return err
 	}
-	if a.primary != nil {
+	if a.writable() {
 		_ = a.primary.Delete()
 	}
 	return a.file.Delete()
@@ -209,10 +249,23 @@ func (k *macKeychain) Name() string { return "macOS Keychain" }
 
 func (k *macKeychain) Get() ([]byte, error) {
 	out, err := exec.Command("security", "find-generic-password", "-s", keychainService, "-a", k.account, "-w").Output()
-	if err != nil {
-		return nil, nil // not found (or locked): no credential here
+	return keychainResult(out, err)
+}
+
+// errSecItemNotFound, as `security` reports it in its exit status.
+const secItemNotFound = 44
+
+// keychainResult maps a `security find-generic-password` outcome. Only "item not found" means absent; any
+// other failure (locked keychain, denied access, missing tool) is an error, never "no credential".
+func keychainResult(out []byte, err error) ([]byte, error) {
+	var ee *exec.ExitError
+	switch {
+	case err == nil:
+		return base64.StdEncoding.DecodeString(strings.TrimSpace(string(out)))
+	case errors.As(err, &ee) && ee.ExitCode() == secItemNotFound:
+		return nil, nil
 	}
-	return base64.StdEncoding.DecodeString(strings.TrimSpace(string(out)))
+	return nil, fmt.Errorf("the macOS Keychain could not be read: %w", err)
 }
 
 func (k *macKeychain) Set(b []byte) error {
@@ -238,11 +291,25 @@ type secretService struct{ account string }
 func (s *secretService) Name() string { return "Secret Service" }
 
 func (s *secretService) Get() ([]byte, error) {
-	out, err := exec.Command("secret-tool", "lookup", "service", keychainService, "account", s.account).Output()
-	if err != nil || len(out) == 0 {
+	cmd := exec.Command("secret-tool", "lookup", "service", keychainService, "account", s.account)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	return secretToolResult(out, stderr.Bytes(), err)
+}
+
+// secretToolResult maps a `secret-tool lookup` outcome. It exits 1 silently when nothing matches; a failure
+// (no session bus, locked collection, missing tool) prints a diagnostic or fails otherwise — an error,
+// never "no credential".
+func secretToolResult(out, stderr []byte, err error) ([]byte, error) {
+	var ee *exec.ExitError
+	switch {
+	case err == nil:
+		return base64.StdEncoding.DecodeString(strings.TrimSpace(string(out)))
+	case errors.As(err, &ee) && ee.ExitCode() == 1 && len(bytes.TrimSpace(out)) == 0 && len(bytes.TrimSpace(stderr)) == 0:
 		return nil, nil
 	}
-	return base64.StdEncoding.DecodeString(strings.TrimSpace(string(out)))
+	return nil, fmt.Errorf("the Secret Service could not be read: %w", err)
 }
 
 func (s *secretService) Set(b []byte) error {

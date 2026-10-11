@@ -54,9 +54,9 @@ func TestSessionEnd_RecordsCloseIntentWithoutCredentialWork(t *testing.T) {
 		t.Fatalf("SessionEnd took %s (exit %d): it must not wait for credentials or the network", time.Since(start), code)
 	}
 	run, _ := rec.store.Current(sid)
-	req, ok := rec.store.CloseRequestFor(sid)
-	if !ok || req.Reason != "prompt_input_exit" || req.Run != run.Name || spawned != sid {
-		t.Fatalf("close intent %+v, finalizer %q", req, spawned)
+	reqs := rec.store.CloseRequestsFor(sid, run.Name)
+	if len(reqs) != 1 || reqs[0].Reason != "prompt_input_exit" || spawned != sid {
+		t.Fatalf("close intents %+v, finalizer %q", reqs, spawned)
 	}
 }
 

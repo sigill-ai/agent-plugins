@@ -34,6 +34,15 @@ type tstInfo struct {
 	GenTime        time.Time `asn1:"generalized"`
 }
 
+// tstInfoRaw carries serialNumber and genTime as given octets (invalid-value tests).
+type tstInfoRaw struct {
+	Version        int
+	Policy         asn1.ObjectIdentifier
+	MessageImprint messageImprint
+	SerialNumber   asn1.RawValue
+	GenTime        asn1.RawValue
+}
+
 // tstInfoNoSerial and tstInfoNoGenTime are TSTInfos missing a mandatory field (negative tests).
 type tstInfoNoSerial struct {
 	Version        int
@@ -68,6 +77,10 @@ type Options struct {
 	OmitSerial    bool // TSTInfo without serialNumber
 	OmitGenTime   bool // TSTInfo without genTime
 	BERTSTInfo    bool // the TSTInfo SEQUENCE encoded with an indefinite length
+
+	Version       int    // TSTInfo version when non-zero (default 1)
+	SerialContent []byte // when non-nil: the serialNumber INTEGER's content octets as given (may be empty)
+	GenTime       string // when non-empty: the genTime GeneralizedTime's characters as given
 }
 
 type encapContentInfo struct {
@@ -89,13 +102,30 @@ type contentInfo struct {
 
 // Token returns a DER token whose TSTInfo states imprint under alg, with one structurally complete
 // SignerInfo (its signature is a placeholder: there is no TSA).
-func Token(alg asn1.ObjectIdentifier, imprint []byte) []byte { return TokenWith(alg, imprint, Options{}) }
+func Token(alg asn1.ObjectIdentifier, imprint []byte) []byte {
+	return TokenWith(alg, imprint, Options{})
+}
 
 // TokenWith is Token shaped by opts.
 func TokenWith(alg asn1.ObjectIdentifier, imprint []byte, opts Options) []byte {
 	mi := messageImprint{algID{alg}, imprint}
 	policy, serial, gen := asn1.ObjectIdentifier{1, 2, 3}, big.NewInt(1), time.Date(2026, 10, 11, 0, 0, 0, 0, time.UTC)
-	var v any = tstInfo{Version: 1, Policy: policy, SerialNumber: serial, GenTime: gen, MessageImprint: mi}
+	version := 1
+	if opts.Version != 0 {
+		version = opts.Version
+	}
+	var v any = tstInfo{Version: version, Policy: policy, SerialNumber: serial, GenTime: gen, MessageImprint: mi}
+	if opts.SerialContent != nil || opts.GenTime != "" {
+		serialRaw := asn1.RawValue{Tag: asn1.TagInteger, Bytes: serial.Bytes()}
+		if opts.SerialContent != nil {
+			serialRaw.Bytes = opts.SerialContent
+		}
+		genRaw := asn1.RawValue{Tag: asn1.TagGeneralizedTime, Bytes: []byte(gen.Format("20060102150405Z"))}
+		if opts.GenTime != "" {
+			genRaw.Bytes = []byte(opts.GenTime)
+		}
+		v = tstInfoRaw{Version: version, Policy: policy, MessageImprint: mi, SerialNumber: serialRaw, GenTime: genRaw}
+	}
 	switch {
 	case opts.OmitSerial:
 		v = tstInfoNoSerial{Version: 1, Policy: policy, GenTime: gen, MessageImprint: mi}
