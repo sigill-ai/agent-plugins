@@ -195,6 +195,14 @@ func runHook() int {
 	store := state.Store{Dir: cfg.DataDir}
 	ctx, cancel := context.WithDeadline(context.Background(), hookStart.Add(hookBudget-persistSlack))
 	defer cancel()
+	if in.HookEventName == "SessionEnd" {
+		// Claude Code keeps SessionEnd short: the close intent is made durable first, locally, with no
+		// credential, keychain or network work; the detached finalizer resolves credentials and seals.
+		if requestClose(ctx, store, in) {
+			spawn(in.SessionID)
+		}
+		return 0
+	}
 	// Credentials are resolved BEFORE the session lock (lock order: credential, then session).
 	be, account, err := newBackend(ctx, cfg)
 	if err != nil {
@@ -213,10 +221,6 @@ func runHook() int {
 	})
 	if err != nil {
 		logf(store, "session %s event %s: %v", state.SessionKey(in.SessionID), in.HookEventName, err)
-	}
-	if in.HookEventName == "SessionEnd" && run != nil && run.CloseRequested != "" && !run.Closed {
-		spawnFinalizer(in.SessionID) // run_end is sealed outside this short-lived hook
-		return 0
 	}
 	if cfg.Index {
 		if run != nil {
@@ -248,7 +252,10 @@ func (r *recorder) handle(ctx context.Context, in input) (*state.Run, error) {
 	}
 	if run != nil {
 		if err := r.recover(run); err != nil {
-			return run, err
+			if run.Broken != initInterrupted {
+				return run, err
+			}
+			logf(r.store, "run %s: %s; continuing in a new run", run.Name, initInterrupted)
 		}
 		if run.Account != "" && run.Account != r.account && !run.Closed && run.Broken == "" {
 			// Another account or organisation is connected now: the run is left as it is,
@@ -261,6 +268,9 @@ func (r *recorder) handle(ctx context.Context, in input) (*state.Run, error) {
 			}
 			run = nil // record from here on in a new run of the current account
 		}
+	}
+	if run != nil && run.Broken == initInterrupted && in.HookEventName != "SessionEnd" {
+		run = nil // the interrupted run is kept as it is; this session continues in a fresh run
 	}
 	if run != nil && (run.Closed || run.Broken != "" || run.CloseRequested != "") {
 		if in.HookEventName != "SessionStart" {
@@ -317,6 +327,8 @@ func (r *recorder) handle(ctx context.Context, in input) (*state.Run, error) {
 		return run, r.store.Save(run)
 
 	case "PreToolUse":
+		// toolCallCommitted is set by seal() only when THIS invocation durably commits the tool_call (or the
+		// delegation for an Agent call): a nil error alone never authorizes a consequential tool.
 		if isAgentTool(in.ToolName) && target.Version() == "2" && hasRoomToDelegate(target) {
 			err = r.delegate(ctx, target, in, ext)
 		} else {
@@ -325,14 +337,13 @@ func (r *recorder) handle(ctx context.Context, in input) (*state.Run, error) {
 			objs := []evidence.Object{evidence.NewObject("tool-arguments", "application/json", jsonOrEmpty(in.ToolInput))}
 			err = r.record(ctx, &run, target, in, "tool_call", step, conseq, conseq && target.Policy.Consequential, ext, objs)
 		}
-		if err == nil {
-			r.toolCallCommitted = true
-		}
 		return run, err
 
 	case "PostToolUse":
 		if isAgentTool(in.ToolName) {
-			r.checkPairing(target, in)
+			if err := r.checkPairing(ctx, target, in); err != nil {
+				return run, err
+			}
 		}
 		step := map[string]any{"tool": toolBlock(in.ToolName, in.ToolUseID, false)}
 		objs := []evidence.Object{evidence.NewObject("tool-result", "application/json", jsonOrEmpty(in.ToolResponse))}
@@ -520,7 +531,13 @@ func (r *recorder) seal(ctx context.Context, run *state.Run, stepType string, st
 	env := evidence.Event(time.Now(), run.Version(), evidence.Actor{Type: "agent", ID: run.AgentID, Version: run.AgentVersion},
 		activityName, run.CorrelationID, run.NextSeq, run.PrevSig, binds, stepType, step, conseq, stamp, ext, objs)
 	p := state.Pending{Name: fmt.Sprintf("%04d-%s", run.NextSeq, stepType), Seq: run.NextSeq, Close: stepType == "run_end"}
-	return r.commitSealed(ctx, run, env, evidence.ExecutionEvidenceContentType, objs, stamp, p)
+	if err := r.commitSealed(ctx, run, env, evidence.ExecutionEvidenceContentType, objs, stamp, p); err != nil {
+		return err
+	}
+	if stepType == "tool_call" || stepType == "delegation" {
+		r.toolCallCommitted = true
+	}
+	return nil
 }
 
 // commitSealed is the crash-consistent commit protocol for one artifact:
@@ -539,6 +556,7 @@ func (r *recorder) commitSealed(ctx context.Context, run *state.Run, env map[str
 		return r.breakRun(run, "envelope could not be canonicalized")
 	}
 	p.EnvelopeHash = hash
+	p.Queue = r.cfg.Index
 	run.Pending = &p
 	if err := r.store.Save(run); err != nil {
 		run.Pending = nil
@@ -605,11 +623,21 @@ func (r *recorder) recover(run *state.Run) error {
 		return nil
 	}
 	if p == nil {
+		if run.NextSeq == 0 && !run.Closed {
+			// Started but never reached run_start (the process died after creating the run or after its
+			// Control Artifact): nothing may be sealed on this chain, least of all a tool_call at seq 0.
+			return r.breakRun(run, initInterrupted)
+		}
 		return r.reconcile(run)
 	}
 	if a, err := r.store.LoadArtifact(run, p.Name); err == nil {
 		if _, h, herr := evidence.EnvelopeHash(json.RawMessage(a.Envelope)); herr == nil && h == p.EnvelopeHash {
 			if sig := evidence.SignatureSha256(a.Signature); sig != "" {
+				if p.Queue { // the delivery marker may not have been written before the crash
+					if err := r.store.Enqueue(run, p.Name); err != nil {
+						return err
+					}
+				}
 				if err := r.advance(run, *p, sig); err != nil {
 					return err
 				}
@@ -619,6 +647,9 @@ func (r *recorder) recover(run *state.Run) error {
 	}
 	return r.breakRun(run, fmt.Sprintf("interrupted while sealing %s; the outcome is unknown, so the run is not continued", p.Name))
 }
+
+// initInterrupted marks a run whose start was interrupted before run_start was sealed.
+const initInterrupted = "interrupted while starting: run_start was never sealed"
 
 func (r *recorder) breakRun(run *state.Run, reason string) error {
 	run.Broken = reason
@@ -758,6 +789,35 @@ func deadlineOf(ctx context.Context) time.Time {
 	}
 	return time.Now().Add(hookBudget)
 }
+
+// requestClose records that the session ended on its current run (session lock only) and reports whether
+// a finalizer must run.
+func requestClose(ctx context.Context, store state.Store, in input) bool {
+	need := false
+	err := store.WithLock(ctx, in.SessionID, func() error {
+		run, err := store.Current(in.SessionID)
+		if err != nil || run == nil || run.Closed || run.Broken != "" {
+			return err
+		}
+		need = true
+		if run.CloseRequested != "" {
+			return nil
+		}
+		reason := in.Reason
+		if reason == "" {
+			reason = "other"
+		}
+		run.CloseRequested = reason
+		return store.Save(run)
+	})
+	if err != nil {
+		logf(store, "session %s event SessionEnd: %v", state.SessionKey(in.SessionID), err)
+	}
+	return need
+}
+
+// spawn starts the detached finalizer (a variable so tests can observe it).
+var spawn = spawnFinalizer
 
 // spawnFinalizer starts `sigill-hook finalize` in its own session so it outlives the
 // SessionEnd hook, whose time budget Claude Code keeps short.

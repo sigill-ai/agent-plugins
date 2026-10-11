@@ -85,6 +85,11 @@ func (c *Client) IndexBatch(ctx context.Context, items []IndexItem) ([]IndexOutc
 // ── MCP (Sigill sign-in) ────────────────────────────────────────────────────
 
 // MCPClient calls the agent-recording tools on POST {Base}/mcp with an OAuth access token.
+//
+// It deliberately sends tools/call without an MCP initialize handshake: every hook is a short-lived process,
+// and Sigill's /mcp endpoint is stateless (plain JSON responses, no session id, no SSE), so it answers
+// tools/call on its own. An initialize per hook would add a round trip to every recorded step and buy
+// nothing. This relies on that documented server behaviour; a test pins that no initialize is sent.
 type MCPClient struct {
 	Base  string
 	Token string

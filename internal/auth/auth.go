@@ -256,7 +256,11 @@ func (m *Manager) Connect(ctx context.Context, o ConnectOptions) (*Credential, e
 		if old != nil && old.RefreshToken != "" && old.RevokeURL != "" {
 			m.revoke(ctx, old) // best effort: the replaced connection ends
 		}
-		return m.save(cred)
+		if err := m.save(cred); err != nil {
+			return err
+		}
+		m.clearRefreshInFlight() // a new grant: an interrupted refresh of the old one no longer matters
+		return nil
 	})
 	return cred, err
 }
@@ -375,11 +379,21 @@ func (m *Manager) AccessToken(ctx context.Context, issuer string) (string, *Cred
 			return ErrNotConnected
 		}
 		cred = cur
+		// Under the lock no other refresh is running: a marker left behind means one was interrupted.
+		if m.refreshInFlight() && cred.Uncertain == "" {
+			cred.Uncertain = "a token refresh was interrupted"
+			return m.save(cred)
+		}
 		if time.Until(cred.AccessExpiry) > refreshMargin || cred.Uncertain != "" {
 			return nil
 		}
 		if cred.RefreshToken == "" {
 			return ErrNotConnected
+		}
+		// The in-flight marker is durable BEFORE the refresh token leaves: if this process dies after the
+		// server rotated it, or the new credential cannot be stored, the old token is never replayed.
+		if err := m.markRefreshInFlight(); err != nil {
+			return err
 		}
 		t, err := m.tokenRequest(ctx, cred.TokenURL, url.Values{
 			"grant_type": {"refresh_token"}, "refresh_token": {cred.RefreshToken}, "client_id": {cred.ClientID},
@@ -392,16 +406,22 @@ func (m *Manager) AccessToken(ctx context.Context, issuer string) (string, *Cred
 				cred.Uncertain = aerr.Error()
 			}
 		case errors.As(err, &notSent):
-			return err // nothing was spent; a later hook tries again
+			m.clearRefreshInFlight() // the request never left this machine: nothing was spent
+			return err
 		case t != nil && (t.Error == "invalid_grant" || t.Error == "invalid_client" || t.Error == "unauthorized_client"):
 			cred.RefreshToken = "" // refused: the grant is gone (revoked, expired, replaced)
 			cred.Uncertain = "the connection was ended (" + t.Error + ")"
 		case t != nil && t.Error == "http 429":
-			return err // throttled before processing: nothing was spent
+			m.clearRefreshInFlight() // throttled before processing: nothing was spent
+			return err
 		default:
 			cred.Uncertain = "a token refresh got no answer"
 		}
-		return m.save(cred)
+		if err := m.save(cred); err != nil {
+			return err // the marker stays: the next hook requires a reconnect instead of replaying
+		}
+		m.clearRefreshInFlight()
+		return nil
 	})
 	if err != nil {
 		return "", cred, err
@@ -419,7 +439,11 @@ func (m *Manager) Disconnect(ctx context.Context) error {
 		if cred != nil {
 			m.revoke(ctx, cred)
 		}
-		return m.Store.Delete()
+		if err := m.Store.Delete(); err != nil {
+			return err
+		}
+		m.clearRefreshInFlight()
+		return nil
 	})
 }
 
@@ -452,6 +476,41 @@ func (m *Manager) load() (*Credential, error) {
 	}
 	return &c, nil
 }
+
+func (m *Manager) inFlightPath() string { return filepath.Join(m.Dir, "refresh.inflight") }
+
+func (m *Manager) refreshInFlight() bool {
+	_, err := os.Lstat(m.inFlightPath())
+	return err == nil
+}
+
+// markRefreshInFlight durably records that a refresh token is about to be sent.
+func (m *Manager) markRefreshInFlight() error {
+	if err := os.MkdirAll(m.Dir, 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(m.inFlightPath(), os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	_, werr := f.WriteString(time.Now().UTC().Format(time.RFC3339))
+	if werr == nil {
+		werr = f.Sync()
+	}
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		return werr
+	}
+	if d, err := os.Open(m.Dir); err == nil { // the directory entry, too
+		_ = d.Sync()
+		d.Close()
+	}
+	return nil
+}
+
+func (m *Manager) clearRefreshInFlight() { _ = os.Remove(m.inFlightPath()) }
 
 func (m *Manager) save(c *Credential) error {
 	raw, _ := json.Marshal(c)

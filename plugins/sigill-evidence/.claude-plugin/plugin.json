@@ -1,6 +1,6 @@
 {
   "name": "sigill",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Records each Claude Code session as verifiable agent evidence and seals it with Sigill. Prompts, tool arguments and results never leave your machine \u2014 only their SHA-256 digests are sealed.",
   "author": {
     "name": "Sigill",

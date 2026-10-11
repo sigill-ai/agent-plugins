@@ -77,7 +77,10 @@ func (r *recorder) delegate(ctx context.Context, run *state.Run, in input, ext m
 	}
 	objs := []evidence.Object{evidence.NewObject("delegation-input", "application/json", jsonOrEmpty(in.ToolInput))}
 	run.Delegations = append(run.Delegations, d) // the intent travels with this event's Pending
-	if err := r.seal(ctx, run, "delegation", map[string]any{"delegation": block}, false, false, ext, objs); err != nil {
+	// Starting a sub-agent is classified like any tool (SIGILL_CONSEQUENTIAL_TOOLS may list Agent/Task) and
+	// follows the same timestamp policy as a tool_call.
+	conseq := r.cfg.isConsequential(in.ToolName)
+	if err := r.seal(ctx, run, "delegation", map[string]any{"delegation": block}, conseq, conseq && run.Policy.Consequential, ext, objs); err != nil {
 		if run.Broken == "" { // nothing was requested: forget the intent
 			run.Delegations = run.Delegations[:len(run.Delegations)-1]
 			_ = r.store.Save(run)
@@ -89,24 +92,33 @@ func (r *recorder) delegate(ctx context.Context, run *state.Run, in input, ext m
 }
 
 // startChild opens the run for a sub-agent that just started (SubagentStart). Claude Code does not say
-// which Agent call started it; launches run one at a time (PreToolUse → SubagentStart → PostToolUse), so
-// the oldest pending delegation of the same type is its own. PostToolUse confirms it (checkPairing).
+// which Agent call started it. A sub-agent is bound only when that is unambiguous: exactly one committed,
+// unpaired delegation of its type in the session, and pairing not stopped by an earlier contradiction.
+// Otherwise its events stay in the delegating chain, tagged, and the delegation remains unresolved (the
+// parent then closes aborted): never a guessed binding.
 func (r *recorder) startChild(ctx context.Context, main *state.Run, in input) error {
 	var parent *state.Run
-	idx := -1
+	idx, candidates := -1, 0
 	for _, run := range r.sessionRuns(main) {
+		if run.PairingStopped {
+			logf(r.store, "session %s: sub-agent %s not bound (pairing stopped after a contradiction)", state.SessionKey(main.SessionID), in.AgentID)
+			return nil
+		}
 		if run.Closed || run.Broken != "" || run.CloseRequested != "" || run.Version() != "2" {
 			continue
 		}
 		for i, d := range run.Delegations {
-			pending := d.Committed(run) && d.ChildRun == "" && !d.Resolved(run) && d.SubagentType == in.AgentType
-			if pending && (parent == nil || d.CreatedAt.Before(parent.Delegations[idx].CreatedAt)) {
+			if d.Committed(run) && d.ChildRun == "" && !d.Resolved(run) && d.SubagentType == in.AgentType {
+				candidates++
 				parent, idx = run, i
 			}
 		}
 	}
-	if parent == nil {
-		return nil // no declared delegation: the sub-agent's events are recorded in the main run, tagged
+	if candidates != 1 {
+		if candidates > 1 {
+			logf(r.store, "session %s: sub-agent %s not bound: %d pending delegations of type %s", state.SessionKey(main.SessionID), in.AgentID, candidates, in.AgentType)
+		}
+		return nil // events are recorded in the delegating chain, tagged
 	}
 	d := &parent.Delegations[idx]
 	d.ChildRun = time.Now().UTC().Format("20060102T150405Z") + "-" + evidence.NewUUID()[:8]
@@ -156,13 +168,23 @@ func (r *recorder) childByAgent(session, agentID string) (*state.Run, error) {
 	return nil, nil
 }
 
-// closeChild ends a sub-agent run (its last output, then run_end) and records the result in its parent.
+// closeChild ends a sub-agent run and records the result in its parent, with the same closure protocol as
+// every run: its own sub-agents are closed and resolved first; its last output is sealed only while the
+// output and run_end still fit the bundle limit; it closes "aborted" when a delegation stays unresolved.
 func (r *recorder) closeChild(ctx context.Context, child *state.Run, lastMessage, disposition, detail string) error {
 	if !child.Closed && child.Broken == "" {
+		r.closeChildren(ctx, child, "parent sub-agent ended")
+		if child.Outstanding() > 0 {
+			disposition = "aborted"
+		}
 		if lastMessage != "" {
-			objs := []evidence.Object{evidence.NewObject("model-output", "text/markdown", []byte(lastMessage))}
-			if err := r.seal(ctx, child, "model_output", nil, false, false, nil, objs); err != nil {
-				return err
+			if child.NextSeq+2 <= maxEvents { // model_output + run_end
+				objs := []evidence.Object{evidence.NewObject("model-output", "text/markdown", []byte(lastMessage))}
+				if err := r.seal(ctx, child, "model_output", nil, false, false, nil, objs); err != nil {
+					return err
+				}
+			} else {
+				logf(r.store, "run %s: no room for the sub-agent's last output; closing with run_end", child.Name)
 			}
 		}
 		step := map[string]any{"finalSeq": child.NextSeq, "finalPrevSignatureSha256": child.PrevSig, "runDisposition": disposition}
@@ -291,18 +313,28 @@ func (r *recorder) reconcile(run *state.Run) error {
 }
 
 // checkPairing compares Claude Code's own answer (PostToolUse.tool_response.agentId) with the sub-agent
-// run opened for that Agent call. A mismatch is a producer fidelity problem (§11), reported locally.
-func (r *recorder) checkPairing(run *state.Run, in input) {
+// run bound to that Agent call. On a contradiction the producer's launch-to-child claim is unreliable: a
+// checkpoint in the delegating run records it (signed, so verifiers see it), and pairing stops for the rest
+// of the session (agent-delegation-v1.md §11). The sealed history is kept as it is.
+func (r *recorder) checkPairing(ctx context.Context, run *state.Run, in input) error {
 	var resp struct {
 		AgentID string `json:"agentId"`
 	}
 	if json.Unmarshal(in.ToolResponse, &resp) != nil || resp.AgentID == "" {
-		return
+		return nil
 	}
 	for _, d := range run.Delegations {
-		if d.UseID == in.ToolUseID && d.ClaudeAgentID != "" && d.ClaudeAgentID != resp.AgentID {
-			logf(r.store, "run %s: sub-agent pairing mismatch for %s (recorded %s, Claude Code reports %s)",
-				run.Name, in.ToolUseID, d.ClaudeAgentID, resp.AgentID)
+		if d.UseID != in.ToolUseID || d.ClaudeAgentID == "" || d.ClaudeAgentID == resp.AgentID {
+			continue
 		}
+		logf(r.store, "run %s: sub-agent pairing contradiction for %s (bound %s, Claude Code reports %s)",
+			run.Name, in.ToolUseID, d.ClaudeAgentID, resp.AgentID)
+		detail := fmt.Sprintf("capture-fidelity: delegation seq %d paired with a different sub-agent than Claude Code reports", d.Seq)
+		run.PairingStopped = true
+		if err := r.store.Save(run); err != nil {
+			return err
+		}
+		return r.seal(ctx, run, "checkpoint", map[string]any{"detail": detail}, false, false, nil, nil)
 	}
+	return nil
 }

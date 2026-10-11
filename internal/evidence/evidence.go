@@ -10,7 +10,6 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -226,11 +225,11 @@ func strictB64URL(s string) bool {
 	return true
 }
 
-// CheckSignatureTimestamp verifies that a sealed JWS carries the signature timestamp
-// a required timestamp demands (common rules §6.2): a JAdES sigTst in the classical
-// entry's etsiU whose RFC 3161 token is bound to THIS signature — its message imprint
-// (SHA-256, -384 or -512 over the base64url signature value, JAdES §5.3.4) occurs in
-// the token. It does not verify the TSA's signature; verifiers do that.
+// CheckSignatureTimestamp checks that a sealed JWS carries the signature timestamp a required timestamp
+// demands (common rules §6.2): a JAdES sigTst in the classical entry's etsiU holding a well-formed RFC 3161
+// token (CMS SignedData over a TSTInfo) whose own messageImprint is the hash, by the algorithm it declares,
+// of the base64url signature value (JAdES §5.3.4). This is a structural and imprint check only: it does
+// not verify the TSA's signature or certificate; verifiers do that.
 func CheckSignatureTimestamp(signature json.RawMessage) error {
 	var jws struct {
 		Signature  *string          `json:"signature"`
@@ -265,11 +264,6 @@ func CheckSignatureTimestamp(signature json.RawMessage) error {
 		return fmt.Errorf("the seal's unprotected header is malformed")
 	}
 	target := []byte(sig)
-	imprints := [][]byte{}
-	s256 := sha256.Sum256(target)
-	s384 := sha512.Sum384(target)
-	s512 := sha512.Sum512(target)
-	imprints = append(imprints, s256[:], s384[:], s512[:])
 	for _, comp := range h.EtsiU {
 		raw, err := base64.RawURLEncoding.DecodeString(comp)
 		if err != nil {
@@ -290,10 +284,14 @@ func CheckSignatureTimestamp(signature json.RawMessage) error {
 			if err != nil {
 				continue
 			}
-			for _, im := range imprints {
-				if bytes.Contains(der, im) {
-					return nil
-				}
+			newHash, imprint, err := tokenImprint(der)
+			if err != nil {
+				continue
+			}
+			hh := newHash()
+			hh.Write(target)
+			if bytes.Equal(hh.Sum(nil), imprint) {
+				return nil
 			}
 		}
 	}

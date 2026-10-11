@@ -73,18 +73,20 @@ type Run struct {
 	// Delegations this run sealed. Each intent is saved with the Pending of the event that commits it,
 	// so after a crash the chain head (NextSeq) decides what was sealed: never two results for one child.
 	Delegations []Delegation `json:"delegations,omitempty"`
+	// PairingStopped: Claude Code contradicted a sub-agent pairing this session; no further sub-agent is bound.
+	PairingStopped bool `json:"pairingStopped,omitempty"`
 }
 
 // Delegation is one sub-agent this run started.
 type Delegation struct {
-	ChildCorrelationID string `json:"childCorrelationId"`
-	ChildAgentID       string `json:"childAgentId"`
-	SubagentType       string `json:"subagentType"`
-	UseID              string `json:"useId,omitempty"`
-	Seq                int    `json:"seq"`           // the delegation event
-	Sig                string `json:"sig,omitempty"` // its signatureSha256, once committed
-	ChildRun           string `json:"childRun,omitempty"`
-	ClaudeAgentID      string `json:"claudeAgentId,omitempty"`
+	ChildCorrelationID string    `json:"childCorrelationId"`
+	ChildAgentID       string    `json:"childAgentId"`
+	SubagentType       string    `json:"subagentType"`
+	UseID              string    `json:"useId,omitempty"`
+	Seq                int       `json:"seq"`           // the delegation event
+	Sig                string    `json:"sig,omitempty"` // its signatureSha256, once committed
+	ChildRun           string    `json:"childRun,omitempty"`
+	ClaudeAgentID      string    `json:"claudeAgentId,omitempty"`
 	ResultSeq          int       `json:"resultSeq"` // the delegation_result event; -1 none
 	CreatedAt          time.Time `json:"createdAt"`
 }
@@ -120,6 +122,9 @@ type Pending struct {
 	Seq          int    `json:"seq"` // -1 for the control artifact
 	EnvelopeHash string `json:"envelopeHash"`
 	Close        bool   `json:"close,omitempty"` // committing it closes the run (run_end)
+	// Queue: the artifact is to be delivered to the index. Recorded before sealing, so recovery recreates
+	// a delivery marker that a crash between the artifact and its marker would otherwise lose.
+	Queue bool `json:"queue,omitempty"`
 }
 
 // Artifact is one sealed artifact in AgentRunBundle form (common rules §7).
@@ -396,6 +401,14 @@ func (s Store) SaveArtifact(r *Run, name string, a Artifact, queue bool) error {
 	}
 	if !queue {
 		return nil
+	}
+	return s.Enqueue(r, name)
+}
+
+// Enqueue marks a stored artifact for index delivery. Idempotent.
+func (s Store) Enqueue(r *Run, name string) error {
+	if name == "" || name != filepath.Base(name) || strings.HasPrefix(name, ".") {
+		return fmt.Errorf("invalid artifact name")
 	}
 	dir, err := mkdirPrivate(s.runPath(r), "outbox")
 	if err != nil {

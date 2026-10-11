@@ -128,6 +128,21 @@ new, linked run, and one event slot per running sub-agent is kept for its result
 session with its sub-agents as one file: `sigill-hook export <session-id> tree.json --tree`,
 and verify it at [sigill.ai/verify-run](https://sigill.ai/verify-run).
 
+## Robustness
+
+- A required timestamp is checked before a step counts as recorded: the seal must carry a well-formed
+  RFC 3161 token whose own message imprint is bound to the seal's signature. (This is a structural check;
+  the TSA's signature is verified by verifiers, e.g. sigill.ai/verify-run.)
+- With `SIGILL_FAIL_CLOSED=1`, a consequential tool (including `Agent` when listed in
+  `SIGILL_CONSEQUENTIAL_TOOLS`) runs only if this hook durably sealed its step.
+- A sub-agent is bound to its own run only when the pairing is unambiguous. If Claude Code later reports a
+  different sub-agent for that call, a signed `checkpoint` records the contradiction and no further
+  sub-agent of the session is bound.
+- Session end is recorded locally first; sign-in and network work happen in the background finalizer.
+- An interrupted token refresh is never replayed: it requires `/sigill:connect` instead.
+- Sign-in uses Sigill's MCP endpoint, which is stateless: each hook calls `tools/call` directly, without an
+  `initialize` round trip.
+
 ## Build
 
 ```sh

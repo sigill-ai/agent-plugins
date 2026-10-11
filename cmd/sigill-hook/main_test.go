@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/sha256"
-	"crypto/sha512"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/sigill-ai/claude-plugins/internal/evidence"
+	"github.com/sigill-ai/claude-plugins/internal/evidence/evidencetest"
 	"github.com/sigill-ai/claude-plugins/internal/sigill"
 	"github.com/sigill-ai/claude-plugins/internal/state"
 )
@@ -78,8 +78,7 @@ func (f *fakeSigill) handler(w http.ResponseWriter, r *http.Request) {
 	entry := map[string]any{"protected": prot, "signature": sig}
 	format := "jades-b-b"
 	if _, off := req["timestamp"]; !off && !noStamp {
-		imprint := sha512.Sum512([]byte(sig))
-		token := append([]byte{0x30, 0x82, 0x01, 0x00, 0x04, 0x40}, imprint[:]...)
+		token := evidencetest.ForSignature(sig)
 		comp, _ := json.Marshal(map[string]any{"sigTst": map[string]any{"tstTokens": []any{map[string]any{"val": base64.StdEncoding.EncodeToString(token)}}}})
 		entry["header"] = map[string]any{"etsiU": []string{base64.RawURLEncoding.EncodeToString(comp)}}
 		format = "jades-b-t"
@@ -695,6 +694,7 @@ type fakeMCP struct {
 	throttle   int // answer this many seal calls with a rate_limited tool error first
 	batches    []int
 	authHeader string
+	methods    []string
 }
 
 func (f *fakeMCP) handler(w http.ResponseWriter, r *http.Request) {
@@ -706,12 +706,16 @@ func (f *fakeMCP) handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var rpc struct {
+		Method string `json:"method"`
 		Params struct {
 			Name      string          `json:"name"`
 			Arguments json.RawMessage `json:"arguments"`
 		} `json:"params"`
 	}
 	json.NewDecoder(r.Body).Decode(&rpc)
+	f.mu.Lock()
+	f.methods = append(f.methods, rpc.Method)
+	f.mu.Unlock()
 	result := func(isErr bool, sc any) {
 		json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "result": map[string]any{"isError": isErr, "structuredContent": sc}})
 	}
@@ -793,6 +797,15 @@ func TestMCPBackend_RecordsAndIndexesInBatches(t *testing.T) {
 	}
 	if len(fake.batches) != 1 || fake.batches[0] != 8 { // ctrl, run_start, 5 tool_calls, run_end
 		t.Fatalf("want one batch of 8, got %v", fake.batches)
+	}
+	// The stateless /mcp is called with tools/call only: no initialize round trip per hook process.
+	for _, m := range fake.methods {
+		if m != "tools/call" {
+			t.Fatalf("unexpected MCP method %q", m)
+		}
+	}
+	if len(fake.methods) == 0 {
+		t.Fatal("no MCP calls observed")
 	}
 }
 
