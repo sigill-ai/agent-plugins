@@ -146,12 +146,15 @@ and verify it at [sigill.ai/verify-run](https://sigill.ai/verify-run).
 ## Build
 
 ```sh
-./build.sh          # cross-compiles plugins/sigill-evidence/libexec/sigill-hook-<os>-<arch>
-go test ./...       # includes the cross-language vectors from sigill-dotnet
+./dev.sh test       # go vet + go test -race, inside a Docker volume
+./dev.sh build      # cross-compile all four binaries inside the volume
+./dev.sh local      # build this machine's binary into libexec/ for a real run (do not commit)
 ```
 
-The build is reproducible with the toolchain pinned in `go.mod`; CI fails if the committed
-binaries differ from a fresh build. See [SECURITY.md](SECURITY.md) to verify them yourself
-and to report a vulnerability.
+`dev.sh` keeps build output off the host filesystem. The shipped binaries are built and
+committed by CI on every push to `main`; pull requests change sources only. The build is
+reproducible with the toolchain pinned in `go.mod` — see [SECURITY.md](SECURITY.md) to verify
+the binaries and to report a vulnerability. Tests include the cross-language vectors from
+sigill-dotnet.
 
 Licensed under Apache-2.0.

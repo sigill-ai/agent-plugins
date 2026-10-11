@@ -16,9 +16,10 @@ sign-in flow on the device, credential storage, and the build that produces the 
 ## What you install
 
 The plugin runs the prebuilt `sigill-hook` binary for your platform from
-`plugins/sigill-evidence/libexec/`. Those binaries are reproducible: CI rebuilds them from
-this source on every push and fails if a single byte differs from what is committed. To check
-for yourself, with the Go toolchain named in `go.mod`:
+`plugins/sigill-evidence/libexec/`. Those binaries are built only by CI: on every push to `main`
+it rebuilds them from source with the toolchain pinned in `go.mod` and commits them
+(`build: plugin binaries for <commit>`). The build is reproducible, so you can check them
+yourself with that toolchain:
 
 ```sh
 ./build.sh
