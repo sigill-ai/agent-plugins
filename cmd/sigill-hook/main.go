@@ -265,6 +265,9 @@ func (r *recorder) handle(ctx context.Context, in input) (*state.Run, error) {
 			}
 			logf(r.store, "run %s: %s; continuing in a new run", run.Name, initInterrupted)
 		}
+		if err := r.applyCloseRequest(run); err != nil {
+			return run, err
+		}
 		if run.Account != "" && run.Account != r.account && !run.Closed && run.Broken == "" {
 			// Another account or organisation is connected now: the run is left as it is,
 			// never continued, finalized or delivered under the new identity.
@@ -437,15 +440,18 @@ func (r *recorder) finalize(ctx context.Context, run *state.Run) error {
 		return nil
 	}
 	// Sub-agents still running end with the session, and their results go in first: a run closes
-	// "completed" only when every delegation has its result (delegation §4 rule 5).
-	r.closeChildren(ctx, run, "session ended")
-	disposition := "completed"
-	if run.Outstanding() > 0 {
-		disposition = "aborted"
+	// "completed" only when every delegation has its result (delegation §4 rule 5). If recording a result
+	// failed, this run is stopped and nothing more — run_end included — is sealed on it.
+	if err := r.closeChildren(ctx, run, "session ended"); err != nil {
+		return err
+	}
+	disposition, detail := closureOf(run, "completed")
+	if run.CloseRequested != "" {
+		detail = joinDetail(detail, "session ended: "+run.CloseRequested)
 	}
 	step := map[string]any{"finalSeq": run.NextSeq, "finalPrevSignatureSha256": run.PrevSig, "runDisposition": disposition}
-	if run.CloseRequested != "" {
-		step["detail"] = "session ended: " + run.CloseRequested
+	if detail != "" {
+		step["detail"] = detail
 	}
 	return r.seal(ctx, run, "run_end", step, false, true, nil, nil)
 }
@@ -561,6 +567,14 @@ func (r *recorder) seal(ctx context.Context, run *state.Run, stepType string, st
 // stops the run. A sequence number is never issued twice.
 func (r *recorder) commitSealed(ctx context.Context, run *state.Run, env map[string]any, contentType string,
 	objs []evidence.Object, stamp bool, p state.Pending) error {
+	// The one place every seal passes: a stopped or closed run never seals again (common rules §6.3 —
+	// a seq is never reused after a failed or ambiguous seal, and nothing follows run_end).
+	if run.Broken != "" {
+		return fmt.Errorf("run %s is stopped (%s): nothing more is sealed", run.Name, run.Broken)
+	}
+	if run.Closed {
+		return fmt.Errorf("run %s is closed: nothing more is sealed", run.Name)
+	}
 	canonical, hash, err := evidence.EnvelopeHash(env)
 	if err != nil {
 		return r.breakRun(run, "envelope could not be canonicalized")
@@ -655,6 +669,11 @@ func (r *recorder) recover(run *state.Run) error {
 				}
 				if err := r.advance(run, *p, sig); err != nil {
 					return err
+				}
+				if run.NextSeq == 0 && !run.Closed {
+					// The recovered artifact was the Control Artifact, but run_start never followed: the same
+					// interrupted initialization as above, reached through a pending commit.
+					return r.breakRun(run, initInterrupted)
 				}
 				return r.reconcile(run)
 			}
@@ -777,7 +796,8 @@ func (r *recorder) sweep(ctx context.Context, self string) {
 			continue
 		}
 		run, err := r.store.CurrentForKey(key)
-		if err != nil || run == nil || run.Closed || run.Broken != "" || run.CloseRequested == "" ||
+		if err != nil || run == nil || run.Closed || run.Broken != "" ||
+			(run.CloseRequested == "" && !r.store.CloseRequestedForKey(key)) ||
 			(run.Account != "" && run.Account != r.account) {
 			continue
 		}
@@ -787,6 +807,9 @@ func (r *recorder) sweep(ctx context.Context, self string) {
 				return err
 			}
 			if err := r.recover(cur); err != nil {
+				return err
+			}
+			if err := r.applyCloseRequest(cur); err != nil {
 				return err
 			}
 			if cur.Closed || cur.Broken != "" || cur.CloseRequested == "" {
@@ -805,30 +828,45 @@ func deadlineOf(ctx context.Context) time.Time {
 	return time.Now().Add(hookBudget)
 }
 
-// requestClose records that the session ended on its current run (session lock only) and reports whether
-// a finalizer must run.
+// requestClose records that the session ended on its current run and reports whether a finalizer must run.
+//
+// It never waits for the session lock: a hook that is sealing holds that lock for up to the full hook
+// budget, longer than Claude Code lets SessionEnd live. The request is a separate, atomically written file
+// bound to the run that was current; the finalizer, a sweep or the next hook applies it under the lock.
 func requestClose(ctx context.Context, store state.Store, in input) bool {
-	need := false
-	err := store.WithLock(ctx, in.SessionID, func() error {
-		run, err := store.Current(in.SessionID)
-		if err != nil || run == nil || run.Closed || run.Broken != "" {
+	run, err := store.Current(in.SessionID) // read-only: state files are replaced atomically
+	if err != nil || run == nil || run.Closed || run.Broken != "" {
+		if err != nil {
+			logf(store, "session %s event SessionEnd: %v", state.SessionKey(in.SessionID), err)
+		}
+		return false
+	}
+	reason := in.Reason
+	if reason == "" {
+		reason = "other"
+	}
+	if err := store.RequestClose(in.SessionID, run.Name, reason); err != nil {
+		logf(store, "session %s event SessionEnd: %v", state.SessionKey(in.SessionID), err)
+		return false
+	}
+	return true
+}
+
+// applyCloseRequest turns a lock-free close request into the run's CloseRequested, under the session lock.
+// The run state is saved before the request is removed, so a crash in between only applies it twice.
+func (r *recorder) applyCloseRequest(run *state.Run) error {
+	req, ok := r.store.CloseRequestFor(run.SessionID)
+	if !ok {
+		return nil
+	}
+	if req.Run == run.Name && !run.Closed && run.Broken == "" && run.CloseRequested == "" {
+		run.CloseRequested = req.Reason
+		if err := r.store.Save(run); err != nil {
 			return err
 		}
-		need = true
-		if run.CloseRequested != "" {
-			return nil
-		}
-		reason := in.Reason
-		if reason == "" {
-			reason = "other"
-		}
-		run.CloseRequested = reason
-		return store.Save(run)
-	})
-	if err != nil {
-		logf(store, "session %s event SessionEnd: %v", state.SessionKey(in.SessionID), err)
 	}
-	return need
+	r.store.ClearCloseRequest(run.SessionID)
+	return nil
 }
 
 // spawn starts the detached finalizer (a variable so tests can observe it).
@@ -871,6 +909,9 @@ func cmdFinalize(args []string) int {
 		}
 		run = cur
 		if err := rec.recover(cur); err != nil {
+			return err
+		}
+		if err := rec.applyCloseRequest(cur); err != nil {
 			return err
 		}
 		if cur.CloseRequested == "" || cur.Closed || cur.Broken != "" {
@@ -1146,18 +1187,22 @@ func cmdStatus() int {
 		certText(cfg.CertificateID), cfg.AgentID, cfg.DataDir, cfg.FailClosed, cfg.Index, cfg.Qualified)
 	store := state.Store{Dir: cfg.DataDir}
 	for _, key := range store.SessionKeys() {
-		run, err := store.CurrentForKey(key)
-		if err != nil || run == nil {
-			continue
+		if store.CloseRequestedForKey(key) {
+			fmt.Printf("session %s: ended, run_end not sealed yet (the finalizer or next session start finishes it)\n", key[:8])
 		}
-		switch {
-		case run.Broken != "":
-			fmt.Printf("run %s: stopped — %s\n", run.Name, run.Broken)
-		case run.CloseRequested != "" && !run.Closed:
-			fmt.Printf("run %s: session ended, run_end not sealed yet (next session start finishes it)\n", run.Name)
-		}
-		if n := len(store.PendingDelivery(run)); n > 0 {
-			fmt.Printf("run %s: %d artifacts waiting for index delivery\n", run.Name, n)
+		for _, run := range store.RunsForKey(key) {
+			switch {
+			case run.Broken != "":
+				fmt.Printf("run %s: stopped — %s\n", run.Name, run.Broken)
+			case run.CloseRequested != "" && !run.Closed:
+				fmt.Printf("run %s: session ended, run_end not sealed yet (next session start finishes it)\n", run.Name)
+			}
+			if run.FidelityIssue != "" {
+				fmt.Printf("run %s: %s — it closes aborted\n", run.Name, run.FidelityIssue)
+			}
+			if n := len(store.PendingDelivery(run)); n > 0 {
+				fmt.Printf("run %s: %d artifacts waiting for index delivery\n", run.Name, n)
+			}
 		}
 	}
 	return 0

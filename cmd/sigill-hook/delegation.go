@@ -173,10 +173,12 @@ func (r *recorder) childByAgent(session, agentID string) (*state.Run, error) {
 // output and run_end still fit the bundle limit; it closes "aborted" when a delegation stays unresolved.
 func (r *recorder) closeChild(ctx context.Context, child *state.Run, lastMessage, disposition, detail string) error {
 	if !child.Closed && child.Broken == "" {
-		r.closeChildren(ctx, child, "parent sub-agent ended")
-		if child.Outstanding() > 0 {
-			disposition = "aborted"
+		if err := r.closeChildren(ctx, child, "parent sub-agent ended"); err != nil {
+			return err // the child itself is stopped: nothing more is sealed on it
 		}
+		var fidelity string
+		disposition, fidelity = closureOf(child, disposition)
+		detail = joinDetail(fidelity, detail)
 		if lastMessage != "" {
 			if child.NextSeq+2 <= maxEvents { // model_output + run_end
 				objs := []evidence.Object{evidence.NewObject("model-output", "text/markdown", []byte(lastMessage))}
@@ -206,7 +208,10 @@ func (r *recorder) closeChild(ctx context.Context, child *state.Run, lastMessage
 }
 
 // closeChildren ends every sub-agent still open below run (deepest first) and resolves them (§4 rule 7).
-func (r *recorder) closeChildren(ctx context.Context, run *state.Run, detail string) {
+// A child that cannot be closed stays unresolved (its parent then closes aborted); that is the child's
+// failure. A failure to seal a result in run itself stops run: it is returned, and the caller seals nothing
+// more on run.
+func (r *recorder) closeChildren(ctx context.Context, run *state.Run, detail string) error {
 	for i := range run.Delegations {
 		d := run.Delegations[i]
 		if !d.Committed(run) || d.Resolved(run) || d.ChildRun == "" {
@@ -216,18 +221,47 @@ func (r *recorder) closeChildren(ctx context.Context, run *state.Run, detail str
 		if err != nil || r.recover(child) != nil {
 			continue // never started, or unknown: the delegation stays unresolved and the parent closes aborted
 		}
-		r.closeChildren(ctx, child, detail)
+		if err := r.closeChildren(ctx, child, detail); err != nil {
+			logf(r.store, "run %s: sub-agent run %s stopped while closing its own sub-agents: %v", run.Name, child.Name, err)
+			continue
+		}
 		if !child.Closed && child.Broken == "" {
-			step := map[string]any{"finalSeq": child.NextSeq, "finalPrevSignatureSha256": child.PrevSig, "runDisposition": "aborted", "detail": detail}
+			disposition, fidelity := closureOf(child, "aborted")
+			step := map[string]any{"finalSeq": child.NextSeq, "finalPrevSignatureSha256": child.PrevSig,
+				"runDisposition": disposition, "detail": joinDetail(fidelity, detail)}
 			if err := r.seal(ctx, child, "run_end", step, false, true, nil, nil); err != nil {
 				logf(r.store, "run %s: sub-agent run %s could not be closed: %v", run.Name, child.Name, err)
 				continue
 			}
 		}
 		if err := r.resolve(ctx, run, child); err != nil {
-			logf(r.store, "run %s: result for %s not recorded: %v", run.Name, child.Name, err)
+			return err
 		}
 	}
+	if run.Broken != "" {
+		return fmt.Errorf("run %s is stopped (%s)", run.Name, run.Broken)
+	}
+	return nil
+}
+
+// closureOf is the disposition a run may close with: never "completed" with an unresolved delegation
+// (§4 rule 5) or a known capture-fidelity issue; the issue is returned as the run_end detail.
+func closureOf(run *state.Run, wanted string) (disposition, detail string) {
+	disposition = wanted
+	if run.Outstanding() > 0 || run.FidelityIssue != "" {
+		disposition = "aborted"
+	}
+	return disposition, run.FidelityIssue
+}
+
+func joinDetail(a, b string) string {
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	}
+	return a + "; " + b
 }
 
 // resolve seals the parent's `delegation_result` for a closed child — once (§4 rules 3 and 4).
@@ -331,6 +365,12 @@ func (r *recorder) checkPairing(ctx context.Context, run *state.Run, in input) e
 			run.Name, in.ToolUseID, d.ClaudeAgentID, resp.AgentID)
 		detail := fmt.Sprintf("capture-fidelity: delegation seq %d paired with a different sub-agent than Claude Code reports", d.Seq)
 		run.PairingStopped = true
+		run.FidelityIssue = detail // the run will close "aborted" with this detail, whatever else happens
+		// The checkpoint must not use the slots reserved for results and run_end (§4 rule 6). Without room the
+		// contradiction cannot be recorded safely, so capture stops here.
+		if run.NextSeq+1+run.Outstanding()+1 > maxEvents {
+			return r.breakRun(run, detail+"; it could not be recorded within the event budget, so capture stopped")
+		}
 		if err := r.store.Save(run); err != nil {
 			return err
 		}

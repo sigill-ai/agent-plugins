@@ -86,3 +86,21 @@ func TestTimestamp_IndefiniteLengthBERPasses(t *testing.T) {
 		t.Fatalf("BER indefinite length must be accepted: %v", err)
 	}
 }
+
+// R3-5: a token is a CMS SignedData with a SignerInfo and a DER TSTInfo carrying every mandatory field.
+func TestTimestamp_TruncatedStructuresFail(t *testing.T) {
+	s := sha512.Sum512([]byte(sig))
+	for name, opts := range map[string]evidencetest.Options{
+		"no signerInfos":   {NoSignerInfos: true},
+		"no serialNumber":  {OmitSerial: true},
+		"no genTime":       {OmitGenTime: true},
+		"BER inside TSTInfo": {BERTSTInfo: true},
+	} {
+		if err := CheckSignatureTimestamp(sealWith(sig, evidencetest.TokenWith(evidencetest.OIDSHA512, s[:], opts))); err == nil {
+			t.Errorf("%s: must fail", name)
+		}
+	}
+	if err := CheckSignatureTimestamp(sealWith(sig, evidencetest.TokenWith(evidencetest.OIDSHA512, s[:], evidencetest.Options{}))); err != nil {
+		t.Fatalf("the complete token must pass: %v", err)
+	}
+}

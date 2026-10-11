@@ -1,9 +1,11 @@
 package evidence
 
-// A structural check of RFC 3161 timestamp tokens: enough of CMS and TSTInfo to read the message imprint a
-// token states, with BER tolerance (indefinite lengths, constructed OCTET STRINGs). It does NOT verify the
-// TSA's signature or certificate; verifiers do that. It only establishes that a well-formed token's own
-// messageImprint is bound to the signature being checked.
+// A structural check of RFC 3161 timestamp tokens — NOT TSA verification. It establishes that the token is
+// a well-formed CMS SignedData (RFC 5652) with at least one SignerInfo carrying its mandatory fields, that it
+// encapsulates a DER-encoded TSTInfo (RFC 3161 §2.4.2) with every mandatory field, and that the TSTInfo's own
+// messageImprint is bound to the signature being checked. The outer CMS may be BER (indefinite lengths,
+// constructed OCTET STRINGs). Whether the TSA's signature is valid and its certificate trusted is decided by
+// verifiers (Sigill's verify-objects, the SDKs), never here.
 
 import (
 	"bytes"
@@ -135,9 +137,19 @@ func tokenImprint(token []byte) (func() hash.Hash, []byte, error) {
 	if err != nil || len(inner) != 1 || !universal(inner[0], 16) {
 		return nil, nil, errors.New("the timestamp token's SignedData is malformed")
 	}
+	// SignedData ::= SEQUENCE { version, digestAlgorithms SET, encapContentInfo, [0] certificates OPTIONAL,
+	//                           [1] crls OPTIONAL, signerInfos SET }
 	sd, err := children(inner[0], 2)
-	if err != nil || len(sd) < 3 {
+	if err != nil || len(sd) < 4 || !universal(sd[0], 2) || !universal(sd[1], 17) || !universal(sd[2], 16) {
 		return nil, nil, errors.New("the timestamp token's SignedData is malformed")
+	}
+	for _, opt := range sd[3 : len(sd)-1] {
+		if opt.class != 2 || (opt.number != 0 && opt.number != 1) {
+			return nil, nil, errors.New("the timestamp token's SignedData is malformed")
+		}
+	}
+	if err := checkSignerInfos(sd[len(sd)-1]); err != nil {
+		return nil, nil, err
 	}
 	encap, err := children(sd[2], 3) // version, digestAlgorithms, encapContentInfo
 	if err != nil || len(encap) != 2 || !oidIs(encap[0], oidTSTInfo) || encap[1].class != 2 || encap[1].number != 0 {
@@ -151,13 +163,19 @@ func tokenImprint(token []byte) (func() hash.Hash, []byte, error) {
 	if err != nil {
 		return nil, nil, errors.New("the timestamp token's eContent is not an OCTET STRING")
 	}
+	if !isDER(info, 0) {
+		return nil, nil, errors.New("the TSTInfo is not DER-encoded (RFC 3161 §2.4.2)")
+	}
 	tst, rest, err := readTLV(info, 5)
 	if err != nil || len(rest) != 0 || !universal(tst, 16) {
 		return nil, nil, errors.New("the TSTInfo is malformed")
 	}
-	fields, err := children(tst, 6) // version, policy, messageImprint, …
-	if err != nil || len(fields) < 3 || !universal(fields[0], 2) || !universal(fields[1], 6) || !universal(fields[2], 16) {
-		return nil, nil, errors.New("the TSTInfo is malformed")
+	// TSTInfo ::= SEQUENCE { version INTEGER, policy OID, messageImprint, serialNumber INTEGER,
+	//                        genTime GeneralizedTime, accuracy, ordering, nonce, tsa, extensions (optional) }
+	fields, err := children(tst, 6)
+	if err != nil || len(fields) < 5 || !universal(fields[0], 2) || !universal(fields[1], 6) || !universal(fields[2], 16) ||
+		!universal(fields[3], 2) || !universal(fields[4], 24) {
+		return nil, nil, errors.New("the TSTInfo lacks a mandatory field (version, policy, messageImprint, serialNumber, genTime)")
 	}
 	mi, err := children(fields[2], 7)
 	if err != nil || len(mi) != 2 || !universal(mi[0], 16) {
@@ -186,4 +204,85 @@ func tokenImprint(token []byte) (func() hash.Hash, []byte, error) {
 		return nil, nil, errors.New("the messageImprint's length does not match its hash algorithm")
 	}
 	return h, hashed, nil
+}
+
+// checkSignerInfos requires signerInfos ::= SET OF SignerInfo with at least one SignerInfo carrying its
+// mandatory fields: version INTEGER, sid (IssuerAndSerialNumber or [0] SubjectKeyIdentifier), digestAlgorithm,
+// [0] signedAttrs OPTIONAL, signatureAlgorithm, signature OCTET STRING. Structure only; the signature itself
+// is not checked here.
+func checkSignerInfos(set tlv) error {
+	bad := errors.New("the timestamp token has no well-formed SignerInfo")
+	if !universal(set, 17) {
+		return bad
+	}
+	infos, err := children(set, 3)
+	if err != nil || len(infos) == 0 {
+		return bad
+	}
+	for _, si := range infos {
+		f, err := children(si, 4)
+		if err != nil || !universal(si, 16) || len(f) < 5 || !universal(f[0], 2) {
+			return bad
+		}
+		if !(universal(f[1], 16) || (f[1].class == 2 && f[1].number == 0)) || !universal(f[2], 16) {
+			return bad
+		}
+		i := 3
+		if f[i].class == 2 && f[i].number == 0 { // signedAttrs
+			i++
+		}
+		if len(f) < i+2 || !universal(f[i], 16) || !universal(f[i+1], 4) {
+			return bad
+		}
+	}
+	return nil
+}
+
+// isDER reports whether b is one DER element: definite, minimal lengths throughout and primitive encodings for
+// the string types (X.690 §10). The TSTInfo must be DER (RFC 3161 §2.4.2); its timestamp is what is signed.
+func isDER(b []byte, depth int) bool {
+	rest, ok := derElement(b, depth)
+	return ok && len(rest) == 0
+}
+
+func derElement(b []byte, depth int) ([]byte, bool) {
+	if depth > 32 || len(b) < 2 || b[0]&0x1f == 0x1f {
+		return nil, false
+	}
+	constructed := b[0]&0x20 != 0
+	class, number := b[0]>>6, b[0]&0x1f
+	l, i := int(b[1]), 2
+	switch {
+	case l == 0x80:
+		return nil, false // indefinite
+	case l > 0x80:
+		n := l & 0x7f
+		if n > 4 || len(b) < 2+n || b[2] == 0 {
+			return nil, false // too long, or a leading zero octet
+		}
+		l = 0
+		for _, c := range b[2 : 2+n] {
+			l = l<<8 | int(c)
+		}
+		if l < 0x80 {
+			return nil, false // long form where the short form fits
+		}
+		i = 2 + n
+	}
+	if len(b)-i < l {
+		return nil, false
+	}
+	content := b[i : i+l]
+	if class == 0 && constructed && (number == 3 || number == 4 || number == 12 || (number >= 18 && number <= 30)) {
+		return nil, false // a constructed string (BER only)
+	}
+	if constructed {
+		for len(content) > 0 {
+			var ok bool
+			if content, ok = derElement(content, depth+1); !ok {
+				return nil, false
+			}
+		}
+	}
+	return b[i+l:], true
 }

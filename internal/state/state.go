@@ -76,6 +76,9 @@ type Run struct {
 	Delegations []Delegation `json:"delegations,omitempty"`
 	// PairingStopped: Claude Code contradicted a sub-agent pairing this session; no further sub-agent is bound.
 	PairingStopped bool `json:"pairingStopped,omitempty"`
+	// FidelityIssue records a known capture-fidelity problem of this run (e.g. a contradicted sub-agent
+	// pairing). Such a run never closes "completed": it closes "aborted" with this as its detail.
+	FidelityIssue string `json:"fidelityIssue,omitempty"`
 }
 
 // Delegation is one sub-agent this run started.
@@ -146,6 +149,9 @@ func SessionKey(session string) string {
 func (s Store) sessionDir(session string) string {
 	return filepath.Join(s.Dir, "sessions", SessionKey(session))
 }
+
+// RunPath is the path of a file in the run's directory.
+func (s Store) RunPath(r *Run, elem ...string) string { return s.runPath(r, elem...) }
 
 func (s Store) runPath(r *Run, elem ...string) string {
 	return filepath.Join(append([]string{s.sessionDir(r.SessionID), "runs", r.Name}, elem...)...)
@@ -335,6 +341,96 @@ func (s Store) CurrentForKey(key string) (*Run, error) {
 		return nil, fmt.Errorf("run state does not belong to this session")
 	}
 	return &r, nil
+}
+
+// RunsForKey loads every run of the session stored under key (status, sweeps); runs that do not
+// verifiably belong to that key are skipped.
+func (s Store) RunsForKey(key string) []*Run {
+	if key != filepath.Base(key) || strings.HasPrefix(key, ".") {
+		return nil
+	}
+	entries, _ := os.ReadDir(filepath.Join(s.Dir, "sessions", key, "runs"))
+	runs := []*Run{}
+	for _, e := range entries {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		st, err := readRegular(filepath.Join(s.Dir, "sessions", key, "runs", e.Name(), "state.json"), 4<<20)
+		if err != nil {
+			continue
+		}
+		var r Run
+		if json.Unmarshal(st, &r) != nil || SessionKey(r.SessionID) != key || r.Name != e.Name() {
+			continue
+		}
+		runs = append(runs, &r)
+	}
+	sort.Slice(runs, func(i, j int) bool { return runs[i].Name < runs[j].Name })
+	return runs
+}
+
+// CloseRequest is a session end recorded WITHOUT the session lock (SessionEnd must not wait for a lock a
+// sealing hook may hold longer than Claude Code lets SessionEnd live). It names the run that was current;
+// the finalizer, a sweep or the next hook applies it under the lock.
+type CloseRequest struct {
+	Run    string    `json:"run"`
+	Reason string    `json:"reason"`
+	At     time.Time `json:"at"`
+}
+
+const closeRequestFile = "close-request"
+
+// RequestClose durably records that the session ended on run (atomic write, no lock).
+func (s Store) RequestClose(session, run, reason string) error {
+	if err := s.ensureRoot(); err != nil {
+		return err
+	}
+	dir, err := mkdirPrivate(s.Dir, "sessions", SessionKey(session))
+	if err != nil {
+		return err
+	}
+	raw, _ := json.Marshal(CloseRequest{Run: run, Reason: reason, At: time.Now().UTC()})
+	if err := writeAtomic(dir, closeRequestFile, raw); err != nil {
+		return err
+	}
+	return syncDir(dir)
+}
+
+// CloseRequestFor reads the session's recorded close request, if any.
+func (s Store) CloseRequestFor(session string) (*CloseRequest, bool) {
+	raw, err := readRegular(filepath.Join(s.sessionDir(session), closeRequestFile), 4096)
+	if err != nil {
+		return nil, false
+	}
+	var c CloseRequest
+	if json.Unmarshal(raw, &c) != nil || c.Run == "" {
+		return nil, false
+	}
+	return &c, true
+}
+
+// CloseRequestedForKey reports whether the session stored under key has an unapplied close request.
+func (s Store) CloseRequestedForKey(key string) bool {
+	if key != filepath.Base(key) || strings.HasPrefix(key, ".") {
+		return false
+	}
+	_, err := os.Lstat(filepath.Join(s.Dir, "sessions", key, closeRequestFile))
+	return err == nil
+}
+
+// ClearCloseRequest removes the session's close request once it has been applied (or is stale).
+func (s Store) ClearCloseRequest(session string) {
+	_ = os.Remove(filepath.Join(s.sessionDir(session), closeRequestFile))
+}
+
+// syncDir makes a rename in dir durable across a machine crash (the file data itself is synced first).
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // Runs lists the session's run names, oldest first.

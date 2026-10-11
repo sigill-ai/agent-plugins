@@ -34,6 +34,42 @@ type tstInfo struct {
 	GenTime        time.Time `asn1:"generalized"`
 }
 
+// tstInfoNoSerial and tstInfoNoGenTime are TSTInfos missing a mandatory field (negative tests).
+type tstInfoNoSerial struct {
+	Version        int
+	Policy         asn1.ObjectIdentifier
+	MessageImprint messageImprint
+	GenTime        time.Time `asn1:"generalized"`
+}
+
+type tstInfoNoGenTime struct {
+	Version        int
+	Policy         asn1.ObjectIdentifier
+	MessageImprint messageImprint
+	SerialNumber   *big.Int
+}
+
+type issuerAndSerial struct {
+	Issuer asn1.RawValue
+	Serial *big.Int
+}
+
+type signerInfo struct {
+	Version            int
+	Sid                issuerAndSerial
+	DigestAlgorithm    algID
+	SignatureAlgorithm algID
+	Signature          []byte
+}
+
+// Options shape a token for negative tests.
+type Options struct {
+	NoSignerInfos bool // signerInfos is an empty SET
+	OmitSerial    bool // TSTInfo without serialNumber
+	OmitGenTime   bool // TSTInfo without genTime
+	BERTSTInfo    bool // the TSTInfo SEQUENCE encoded with an indefinite length
+}
+
 type encapContentInfo struct {
 	EContentType asn1.ObjectIdentifier
 	EContent     []byte `asn1:"explicit,tag:0"`
@@ -51,16 +87,46 @@ type contentInfo struct {
 	Content     signedData `asn1:"explicit,tag:0"`
 }
 
-// Token returns a DER token whose TSTInfo states imprint under alg.
-func Token(alg asn1.ObjectIdentifier, imprint []byte) []byte {
-	info, err := asn1.Marshal(tstInfo{Version: 1, Policy: asn1.ObjectIdentifier{1, 2, 3}, SerialNumber: big.NewInt(1),
-		GenTime: time.Date(2026, 10, 11, 0, 0, 0, 0, time.UTC), MessageImprint: messageImprint{algID{alg}, imprint}})
+// Token returns a DER token whose TSTInfo states imprint under alg, with one structurally complete
+// SignerInfo (its signature is a placeholder: there is no TSA).
+func Token(alg asn1.ObjectIdentifier, imprint []byte) []byte { return TokenWith(alg, imprint, Options{}) }
+
+// TokenWith is Token shaped by opts.
+func TokenWith(alg asn1.ObjectIdentifier, imprint []byte, opts Options) []byte {
+	mi := messageImprint{algID{alg}, imprint}
+	policy, serial, gen := asn1.ObjectIdentifier{1, 2, 3}, big.NewInt(1), time.Date(2026, 10, 11, 0, 0, 0, 0, time.UTC)
+	var v any = tstInfo{Version: 1, Policy: policy, SerialNumber: serial, GenTime: gen, MessageImprint: mi}
+	switch {
+	case opts.OmitSerial:
+		v = tstInfoNoSerial{Version: 1, Policy: policy, GenTime: gen, MessageImprint: mi}
+	case opts.OmitGenTime:
+		v = tstInfoNoGenTime{Version: 1, Policy: policy, SerialNumber: serial, MessageImprint: mi}
+	}
+	info, err := asn1.Marshal(v)
 	if err != nil {
 		panic(err)
 	}
+	if opts.BERTSTInfo { // same content, indefinite length: valid BER, not DER
+		var raw asn1.RawValue
+		if _, err := asn1.Unmarshal(info, &raw); err != nil {
+			panic(err)
+		}
+		info = append(append([]byte{0x30, 0x80}, raw.Bytes...), 0, 0)
+	}
+	signers := []asn1.RawValue{}
+	if !opts.NoSignerInfos {
+		emptyName, _ := asn1.Marshal(asn1.RawValue{Class: 0, Tag: 16, IsCompound: true})
+		si, err := asn1.Marshal(signerInfo{Version: 1, Sid: issuerAndSerial{Issuer: asn1.RawValue{FullBytes: emptyName}, Serial: big.NewInt(7)},
+			DigestAlgorithm: algID{alg}, SignatureAlgorithm: algID{asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 1}},
+			Signature: []byte("placeholder")})
+		if err != nil {
+			panic(err)
+		}
+		signers = append(signers, asn1.RawValue{FullBytes: si})
+	}
 	der, err := asn1.Marshal(contentInfo{ContentType: oidSignedData, Content: signedData{Version: 3,
 		DigestAlgorithms: []algID{{alg}}, EncapContentInfo: encapContentInfo{EContentType: oidTSTInfo, EContent: info},
-		SignerInfos: []asn1.RawValue{}}})
+		SignerInfos: signers}})
 	if err != nil {
 		panic(err)
 	}

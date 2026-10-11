@@ -35,6 +35,9 @@ type fakeSigill struct {
 	noStamp   bool // answer timestamp requests with a B-B seal (no sigTst)
 	failAfter int  // fail every seal request after this many (0 = never)
 	delay     time.Duration
+	// failAt fails the n-th seal request (1-based): "503" refuses it, "nosig" answers 200 without a usable
+	// signature (an ambiguous outcome: the server may have signed).
+	failAt map[int]string
 }
 
 func (f *fakeSigill) handler(w http.ResponseWriter, r *http.Request) {
@@ -67,9 +70,14 @@ func (f *fakeSigill) handler(w http.ResponseWriter, r *http.Request) {
 	n := len(f.requests)
 	fail := f.failAfter > 0 && n > f.failAfter
 	noStamp := f.noStamp
+	mode := f.failAt[n]
 	f.mu.Unlock()
-	if fail {
+	if fail || mode == "503" {
 		w.WriteHeader(503)
+		return
+	}
+	if mode == "nosig" {
+		json.NewEncoder(w).Encode(map[string]any{"signature": map[string]any{"signatures": []any{}}, "operationId": evidence.NewUUID()})
 		return
 	}
 	sum := sha256.Sum256(raw)

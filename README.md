@@ -136,10 +136,16 @@ and verify it at [sigill.ai/verify-run](https://sigill.ai/verify-run).
 - With `SIGILL_FAIL_CLOSED=1`, a consequential tool (including `Agent` when listed in
   `SIGILL_CONSEQUENTIAL_TOOLS`) runs only if this hook durably sealed its step.
 - A sub-agent is bound to its own run only when the pairing is unambiguous. If Claude Code later reports a
-  different sub-agent for that call, a signed `checkpoint` records the contradiction and no further
-  sub-agent of the session is bound.
-- Session end is recorded locally first; sign-in and network work happen in the background finalizer.
-- An interrupted token refresh is never replayed: it requires `/sigill:connect` instead.
+  different sub-agent for that call, a signed `checkpoint` records the contradiction, no further
+  sub-agent of the session is bound, and the run closes `aborted` with that detail.
+- If a step's seal fails or comes back without a valid timestamp, the run stops: nothing more is sealed
+  into it, and its close is never reported as `completed`.
+- Session end never waits for the signing lock: it writes a close request bound to the current run, which
+  the next hook, the background finalizer or a later sweep applies.
+- An interrupted token refresh is never replayed: it requires `/sigill:connect` instead. The credential
+  store records which backend holds the credential; ambiguous older state also requires `/sigill:connect`.
+- Local state is written atomically and fsynced (file and directory). This survives a process crash; after
+  power loss the drive's own cache may still lose the last write (macOS `fsync` does not flush it).
 - Sign-in uses Sigill's MCP endpoint, which is stateless: each hook calls `tools/call` directly, without an
   `initialize` round trip.
 

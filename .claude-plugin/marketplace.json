@@ -9,7 +9,7 @@
       "name": "sigill",
       "source": "./plugins/sigill-evidence",
       "description": "Seal every Claude Code session as verifiable agent evidence with Sigill. Blind: only hashes leave your machine.",
-      "version": "0.2.2"
+      "version": "0.2.3"
     }
   ],
   "description": "Sigill plugins for Claude Code: verifiable, blind evidence of agent sessions."

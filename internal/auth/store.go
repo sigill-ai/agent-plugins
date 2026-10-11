@@ -26,116 +26,179 @@ const (
 	keychainService = "ai.sigill.claude-code"
 )
 
-// DefaultStore picks the OS keychain when it is usable and a private file otherwise.
-// SIGILL_CREDENTIAL_STORE=file forces the file (headless machines, tests).
+// DefaultStore returns the installation's credential store. Every mode — OS keychain, Secret Service,
+// private file only (SIGILL_CREDENTIAL_STORE=file, or no keychain usable in this invocation) — goes through
+// one authority protocol (see authority), so switching between them can never read a stale copy.
 func DefaultStore(dir string) SecretStore {
-	file := &FileStore{Path: filepath.Join(dir, "credential.json")}
-	if os.Getenv("SIGILL_CREDENTIAL_STORE") == "file" {
-		return file
-	}
-	account := "default:" + dir // one credential per plugin data directory
+	a := &authority{file: &FileStore{Path: filepath.Join(dir, "credential.json")}, marker: filepath.Join(dir, "credential.store")}
 	switch runtime.GOOS {
 	case "darwin":
+		a.osPrimary = "keychain"
 		if _, err := exec.LookPath("security"); err == nil {
-			return &fallback{primary: &macKeychain{account: account}, file: file, marker: filepath.Join(dir, "credential.store")}
+			a.primary = &macKeychain{account: "default:" + dir} // one credential per plugin data directory
 		}
 	case "linux":
-		if _, err := exec.LookPath("secret-tool"); err == nil && os.Getenv("DBUS_SESSION_BUS_ADDRESS") != "" {
-			return &fallback{primary: &secretService{account: account}, file: file, marker: filepath.Join(dir, "credential.store")}
+		if _, err := exec.LookPath("secret-tool"); err == nil {
+			a.osPrimary = "secret-service"
+			if os.Getenv("DBUS_SESSION_BUS_ADDRESS") != "" {
+				a.primary = &secretService{account: "default:" + dir}
+			}
 		}
 	}
-	return file
+	if os.Getenv("SIGILL_CREDENTIAL_STORE") == "file" {
+		a.primary, a.fileOnly = nil, true
+	}
+	return a
 }
 
-// fallback uses the keychain and falls back to the private file when the keychain fails (locked, no
-// session). Exactly one backend is authoritative at a time, named by a durable private marker
-// ("primary", "file", or "none" after a disconnect): Get reads only that backend, so a superseded
-// secret left in the other one (e.g. a spent refresh token in a keychain that was briefly
-// unavailable) can never be read again. Set writes the new secret first, then flips the marker; a
-// crash in between leaves the previous, consistent state (and the refresh protocol's in-flight
-// marker makes that state uncertain, never replayed). Delete writes the tombstone first.
-type fallback struct {
-	primary SecretStore
-	file    *FileStore
-	marker  string
+// ErrCredentialAmbiguous: a credential stored by an earlier version exists in more than one place, or may
+// exist in a store this invocation cannot read; which one is current cannot be known, so none is used.
+var ErrCredentialAmbiguous = errors.New("the stored Sigill connection cannot be established unambiguously")
+
+// authority keeps exactly one backend authoritative, named by a durable private marker (credential.store):
+// "keychain", "secret-service", "file" or "none" (after a disconnect). Get reads only the named backend —
+// if that backend is not usable in this invocation, it reports so instead of reading another one — so a
+// superseded secret left anywhere else (a spent refresh token in a keychain that was briefly unavailable, a
+// file left from a headless run) is never read. Set writes the new secret, then flips the marker; a crash in
+// between leaves the previous consistent state (and the refresh protocol's in-flight marker makes it
+// uncertain, never replayed). Delete writes the tombstone first. Stores written before markers existed are
+// adopted only when unambiguous; otherwise the user reconnects.
+type authority struct {
+	primary   SecretStore // the OS store, nil when not usable in this invocation
+	osPrimary string      // "keychain" | "secret-service" | "" — what this OS could hold
+	fileOnly  bool        // SIGILL_CREDENTIAL_STORE=file: the file is the only store by choice
+	file      *FileStore
+	marker    string
 }
 
 type storeMarker struct {
-	Backend    string `json:"backend"` // primary | file | none
+	Backend    string `json:"backend"` // keychain | secret-service | file | none ("primary" in 0.2.1–0.2.2)
 	Generation int    `json:"generation"`
 }
 
-func (f *fallback) Name() string { return f.primary.Name() + " (file fallback)" }
+func (a *authority) Name() string {
+	if a.primary != nil {
+		return a.primary.Name() + " (file fallback)"
+	}
+	return "private file"
+}
 
-func (f *fallback) readMarker() (*storeMarker, error) {
-	raw, err := (&FileStore{Path: f.marker}).Get()
+func (a *authority) readMarker() (*storeMarker, error) {
+	raw, err := (&FileStore{Path: a.marker}).Get()
 	if err != nil || len(raw) == 0 {
 		return nil, err
 	}
 	var m storeMarker
-	if err := json.Unmarshal(raw, &m); err != nil || (m.Backend != "primary" && m.Backend != "file" && m.Backend != "none") {
+	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, errors.New("the credential store marker is unreadable")
 	}
-	return &m, nil
+	if m.Backend == "primary" { // written by 0.2.1–0.2.2: this OS's store
+		m.Backend = a.osPrimary
+	}
+	switch m.Backend {
+	case "keychain", "secret-service", "file", "none":
+		return &m, nil
+	}
+	return nil, errors.New("the credential store marker is unreadable")
 }
 
-func (f *fallback) writeMarker(backend string, generation int) error {
+func (a *authority) writeMarker(backend string, generation int) error {
 	raw, _ := json.Marshal(storeMarker{Backend: backend, Generation: generation})
-	return (&FileStore{Path: f.marker}).Set(raw)
+	return (&FileStore{Path: a.marker}).Set(raw) // durable: file and directory entry synced
 }
 
-func (f *fallback) Get() ([]byte, error) {
-	m, err := f.readMarker()
+func (a *authority) primaryID() string {
+	if a.primary == nil {
+		return ""
+	}
+	return a.osPrimary
+}
+
+func (a *authority) Get() ([]byte, error) {
+	m, err := a.readMarker()
+	if err != nil {
+		return nil, err
+	}
+	if m != nil {
+		switch {
+		case m.Backend == "none":
+			return nil, nil // disconnected
+		case m.Backend == "file":
+			return a.file.Get()
+		case m.Backend == a.primaryID():
+			return a.primary.Get()
+		default:
+			return nil, fmt.Errorf("the Sigill connection is stored in the %s, which is not available now", m.Backend)
+		}
+	}
+	// No marker: written before markers existed (or never connected). Adopt only an unambiguous state.
+	var pb []byte
+	if a.primary != nil {
+		pb, _ = a.primary.Get()
+	}
+	fb, err := a.file.Get()
 	if err != nil {
 		return nil, err
 	}
 	switch {
-	case m == nil:
-		// Written before markers existed: the keychain first, as then. The next Set adds a marker.
-		if b, err := f.primary.Get(); err == nil && len(b) > 0 {
-			return b, nil
+	case len(pb) > 0 && len(fb) > 0:
+		if !bytes.Equal(pb, fb) {
+			return nil, ErrCredentialAmbiguous // two different secrets: never guess which is current
 		}
-		return f.file.Get()
-	case m.Backend == "primary":
-		return f.primary.Get()
-	case m.Backend == "file":
-		return f.file.Get()
-	default:
-		return nil, nil // disconnected
+		if err := a.writeMarker(a.primaryID(), 1); err != nil {
+			return nil, err
+		}
+		_ = a.file.Delete()
+		return pb, nil
+	case len(pb) > 0:
+		return pb, a.writeMarker(a.primaryID(), 1)
+	case len(fb) > 0:
+		if a.primary == nil && a.osPrimary != "" && !a.fileOnly {
+			// The OS store this installation may have used cannot be read now; it could hold a newer secret.
+			return nil, ErrCredentialAmbiguous
+		}
+		return fb, a.writeMarker("file", 1)
 	}
+	return nil, nil
 }
 
-func (f *fallback) Set(b []byte) error {
+func (a *authority) Set(b []byte) error {
 	gen := 0
-	if m, err := f.readMarker(); err == nil && m != nil {
+	if m, err := a.readMarker(); err == nil && m != nil {
 		gen = m.Generation
 	}
-	backend := "primary"
-	if err := f.primary.Set(b); err != nil {
-		if err := f.file.Set(b); err != nil {
-			return err
-		}
-		backend = "file"
-	}
-	if err := f.writeMarker(backend, gen+1); err != nil {
+	backend := "file"
+	if a.primary != nil && a.primary.Set(b) == nil {
+		backend = a.primaryID()
+	} else if err := a.file.Set(b); err != nil {
 		return err
 	}
-	if backend == "primary" {
-		_ = f.file.Delete() // the superseded copy, no longer readable anyway
+	if err := a.writeMarker(backend, gen+1); err != nil {
+		return err // not authoritative yet: the caller keeps treating the refresh as uncertain
+	}
+	// The other copy is unreadable under the marker anyway; removing it is housekeeping.
+	if backend == "file" {
+		if a.primary != nil {
+			_ = a.primary.Delete()
+		}
+	} else {
+		_ = a.file.Delete()
 	}
 	return nil
 }
 
-func (f *fallback) Delete() error {
+func (a *authority) Delete() error {
 	gen := 0
-	if m, err := f.readMarker(); err == nil && m != nil {
+	if m, err := a.readMarker(); err == nil && m != nil {
 		gen = m.Generation
 	}
-	if err := f.writeMarker("none", gen+1); err != nil { // the tombstone first: nothing can be resurrected
+	if err := a.writeMarker("none", gen+1); err != nil { // the tombstone first: nothing can be resurrected
 		return err
 	}
-	_ = f.primary.Delete()
-	return f.file.Delete()
+	if a.primary != nil {
+		_ = a.primary.Delete()
+	}
+	return a.file.Delete()
 }
 
 // macKeychain uses `security`. The secret is written through `security -i` on STDIN, so it
@@ -238,7 +301,22 @@ func (f *FileStore) Set(b []byte) error {
 		os.Remove(name)
 		return werr
 	}
-	return os.Rename(name, f.Path)
+	if err := os.Rename(name, f.Path); err != nil {
+		os.Remove(name)
+		return err
+	}
+	// The rename is only durable once the directory entry is synced. This survives a process crash; across
+	// a power loss it is as durable as the OS's fsync (on macOS fsync does not flush the drive's cache).
+	return syncDir(dir)
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 func (f *FileStore) Delete() error {

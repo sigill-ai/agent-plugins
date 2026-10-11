@@ -360,7 +360,11 @@ func (c *Credential) apply(t *tokenResponse) error {
 func (m *Manager) AccessToken(ctx context.Context, issuer string) (string, *Credential, error) {
 	issuer = strings.TrimRight(issuer, "/")
 	cred, err := m.load()
-	if err != nil || cred == nil {
+	if err != nil {
+		// An ambiguous or unavailable store is never guessed at: the user reconnects.
+		return "", nil, fmt.Errorf("%v — run /sigill:connect", err)
+	}
+	if cred == nil {
 		return "", nil, ErrNotConnected
 	}
 	if cred.Issuer != issuer {
@@ -503,11 +507,8 @@ func (m *Manager) markRefreshInFlight() error {
 	if werr != nil {
 		return werr
 	}
-	if d, err := os.Open(m.Dir); err == nil { // the directory entry, too
-		_ = d.Sync()
-		d.Close()
-	}
-	return nil
+	// The directory entry too: if that cannot be made durable, the refresh token is not sent.
+	return syncDir(m.Dir)
 }
 
 func (m *Manager) clearRefreshInFlight() { _ = os.Remove(m.inFlightPath()) }

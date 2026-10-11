@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -109,10 +112,10 @@ func (s *memStore) Delete() error {
 	return nil
 }
 
-func newFallback(t *testing.T) (*fallback, *memStore) {
+func newFallback(t *testing.T) (*authority, *memStore) {
 	dir := t.TempDir()
 	mem := &memStore{}
-	return &fallback{primary: mem, file: &FileStore{Path: filepath.Join(dir, "credential.json")}, marker: filepath.Join(dir, "credential.store")}, mem
+	return &authority{primary: mem, osPrimary: "keychain", file: &FileStore{Path: filepath.Join(dir, "credential.json")}, marker: filepath.Join(dir, "credential.store")}, mem
 }
 
 // R2-3: keychain holds R0; the R1 write fails there and lands in the file; the keychain becomes readable
@@ -156,5 +159,118 @@ func TestFallback_DeleteTombstoneWins(t *testing.T) {
 	_ = fb.Delete()
 	if got, err := fb.Get(); err != nil || got != nil {
 		t.Fatalf("a disconnected store returned %q (%v)", got, err)
+	}
+}
+
+// R3-3: every invocation builds its own store (as every hook process does), and which backends are usable
+// changes between invocations. The marker alone decides; a backend that is not usable now is reported,
+// never substituted by a leftover elsewhere.
+func TestAuthority_AcrossInvocationsAndModeSwitches(t *testing.T) {
+	dir := t.TempDir()
+	mem := &memStore{}
+	gui := func() *authority { // keychain usable
+		return &authority{primary: mem, osPrimary: "keychain", file: &FileStore{Path: filepath.Join(dir, "credential.json")}, marker: filepath.Join(dir, "credential.store")}
+	}
+	headless := func() *authority { // same machine, keychain not usable in this invocation
+		return &authority{osPrimary: "keychain", file: &FileStore{Path: filepath.Join(dir, "credential.json")}, marker: filepath.Join(dir, "credential.store")}
+	}
+	if err := gui().Set([]byte("R0")); err != nil {
+		t.Fatal(err)
+	}
+	// A leftover file from some earlier headless run must not be read while the keychain is authoritative.
+	os.WriteFile(filepath.Join(dir, "credential.json"), []byte("STALE"), 0o600)
+	if _, err := headless().Get(); err == nil || !strings.Contains(err.Error(), "not available") {
+		t.Fatalf("headless read of a keychain-held credential must refuse, got %v", err)
+	}
+	// A headless connect makes the file authoritative; back in the GUI the file is what is read.
+	if err := headless().Set([]byte("R1")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := gui().Get(); err != nil || string(got) != "R1" {
+		t.Fatalf("got %q (%v), want R1", got, err)
+	}
+	// Disconnect in one mode, read in the other: nothing.
+	if err := gui().Delete(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := headless().Get(); err != nil || got != nil {
+		t.Fatalf("after disconnect got %q (%v)", got, err)
+	}
+}
+
+// R3-3: stores written before markers existed are adopted only when unambiguous.
+func TestAuthority_LegacyStatesAreNeverGuessed(t *testing.T) {
+	mk := func(primary SecretStore, fileOnly bool, dir string) *authority {
+		return &authority{primary: primary, osPrimary: "keychain", fileOnly: fileOnly,
+			file: &FileStore{Path: filepath.Join(dir, "credential.json")}, marker: filepath.Join(dir, "credential.store")}
+	}
+	// R0 in the keychain, a newer R1 in the file (0.1/0.2.0 fell back to the file when the keychain failed).
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "credential.json"), []byte("R1"), 0o600)
+	if _, err := mk(&memStore{val: []byte("R0")}, false, dir).Get(); !errors.Is(err, ErrCredentialAmbiguous) {
+		t.Fatalf("two different legacy secrets must be ambiguous, got %v", err)
+	}
+	// Only a file, but the keychain this OS may have used cannot be read now: ambiguous too.
+	dir = t.TempDir()
+	os.WriteFile(filepath.Join(dir, "credential.json"), []byte("R1"), 0o600)
+	if _, err := mk(nil, false, dir).Get(); !errors.Is(err, ErrCredentialAmbiguous) {
+		t.Fatalf("an unreadable keychain must make a legacy file ambiguous, got %v", err)
+	}
+	// File-only by choice: the file is adopted and becomes authoritative.
+	if got, err := mk(nil, true, dir).Get(); err != nil || string(got) != "R1" {
+		t.Fatalf("file-only adoption got %q (%v)", got, err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(dir, "credential.store"))
+	if !strings.Contains(string(raw), `"file"`) {
+		t.Fatalf("marker %s", raw)
+	}
+	// Only the keychain holds it: adopted, marker written, and the same in the next invocation.
+	dir = t.TempDir()
+	mem := &memStore{val: []byte("R2")}
+	if got, err := mk(mem, false, dir).Get(); err != nil || string(got) != "R2" {
+		t.Fatalf("keychain adoption got %q (%v)", got, err)
+	}
+	if got, err := mk(mem, false, dir).Get(); err != nil || string(got) != "R2" {
+		t.Fatalf("next invocation got %q (%v)", got, err)
+	}
+	// A 0.2.1–0.2.2 marker ("primary") still means this OS's store.
+	dir = t.TempDir()
+	os.WriteFile(filepath.Join(dir, "credential.store"), []byte(`{"backend":"primary","generation":3}`), 0o600)
+	if got, err := mk(&memStore{val: []byte("R3")}, false, dir).Get(); err != nil || string(got) != "R3" {
+		t.Fatalf("legacy marker got %q (%v)", got, err)
+	}
+}
+
+// R3-3 at the Manager: an ambiguous store is reported with the reconnect hint, never used.
+func TestManager_AmbiguousStore_RequiresReconnect(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "credential.json"), []byte(`{"issuer":"https://x"}`), 0o600)
+	m := &Manager{Dir: dir, Store: &authority{osPrimary: "keychain", file: &FileStore{Path: filepath.Join(dir, "credential.json")},
+		marker: filepath.Join(dir, "credential.store")}}
+	_, _, err := m.AccessToken(context.Background(), "https://x")
+	if err == nil || !strings.Contains(err.Error(), "/sigill:connect") || !strings.Contains(err.Error(), "unambiguously") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// R3-6: if the in-flight marker cannot be made durable, the refresh token is never sent.
+func TestRefresh_NotSentWhenTheMarkerCannotBeMadeDurable(t *testing.T) {
+	sent := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { sent = true; w.WriteHeader(500) }))
+	defer srv.Close()
+	dir := t.TempDir()
+	m := &Manager{Dir: dir, Store: &FileStore{Path: filepath.Join(dir, "credential.json")}, HTTP: srv.Client()}
+	cred := &Credential{Issuer: srv.URL, TokenURL: srv.URL + "/token", ClientID: "c", RefreshToken: "R0", AccessToken: "a",
+		AccessExpiry: time.Now().Add(-time.Minute)}
+	if err := m.save(cred); err != nil {
+		t.Fatal(err)
+	}
+	// The marker's place is taken by a directory: it cannot be written.
+	os.Mkdir(m.inFlightPath(), 0o700)
+	if _, _, err := m.AccessToken(context.Background(), srv.URL); err == nil {
+		t.Fatal("the refresh must not proceed")
+	}
+	if sent {
+		t.Fatal("the refresh token left the machine without a durable in-flight marker")
 	}
 }
