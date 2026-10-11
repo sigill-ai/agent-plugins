@@ -50,6 +50,17 @@ type RetryableError struct {
 func (e *RetryableError) Error() string { return e.Err.Error() }
 
 // AuthError: the credential was refused; the user must reconnect.
+// QuotaError: the organisation's monthly agent evidence pool is used up. Nothing was sealed; recording
+// resumes when the pool resets. Not a sealing failure, and not retried within the month.
+type QuotaError struct{ ResetsAt string }
+
+func (e *QuotaError) Error() string {
+	if e.ResetsAt == "" {
+		return "the organisation's monthly agent evidence quota is used up; recording resumes when it resets"
+	}
+	return "the organisation's monthly agent evidence quota is used up; recording resumes when it resets (" + e.ResetsAt + ")"
+}
+
 type AuthError struct{ Err error }
 
 func (e *AuthError) Error() string { return e.Err.Error() }
@@ -160,11 +171,15 @@ func (m *MCPClient) call(ctx context.Context, tool string, args any, out any) er
 			Retryable         bool   `json:"retryable"`
 			RetryAfterSeconds int    `json:"retryAfterSeconds"`
 			Status            int    `json:"status"`
+			ResetsAt          string `json:"resetsAt"`
 		}
 		_ = json.Unmarshal(rpc.Result.StructuredContent, &se)
 		msg := se.Error
 		if msg == "" {
 			msg = "tool error"
+		}
+		if se.Error == "agent_evidence_quota_exceeded" {
+			return &QuotaError{ResetsAt: se.ResetsAt}
 		}
 		// Only throttling is a proven "not processed" outcome.
 		if se.Error == "rate_limited" || se.Status == 429 {

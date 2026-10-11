@@ -5,7 +5,7 @@
 # binaries on any machine. CI rebuilds on every push and fails if the committed binaries
 # or SHA256SUMS differ, so what you install is what this source compiles to.
 set -e
-VERSION=${VERSION:-0.2.1}
+VERSION=${VERSION:-0.2.2}
 OUT=plugins/sigill-evidence/libexec
 want=$(sed -n 's/^toolchain //p' go.mod)
 have=$(go env GOVERSION)

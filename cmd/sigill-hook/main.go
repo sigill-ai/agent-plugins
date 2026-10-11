@@ -570,6 +570,11 @@ func (r *recorder) commitSealed(ctx context.Context, run *state.Run, env map[str
 		err = evidence.CheckSignatureTimestamp(res.Signature) // common rules §6.2
 	}
 	if err != nil {
+		var quota *sigill.QuotaError
+		if errors.As(err, &quota) {
+			// Not a sealing failure: nothing was sealed, and the run ends here (a seq is never skipped).
+			return r.breakRun(run, fmt.Sprintf("not recorded from %s on: %v", p.Name, err))
+		}
 		return r.breakRun(run, fmt.Sprintf("%s could not be sealed: %v", p.Name, err))
 	}
 	art := state.Artifact{Envelope: canonical, Signature: res.Signature, ObjectDigests: evidence.Digests(objs)}

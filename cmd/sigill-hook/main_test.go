@@ -864,3 +864,33 @@ func TestSessionReference_LinksSegments(t *testing.T) {
 		t.Fatalf("both runs must carry the same 32-hex session reference: %v", refs)
 	}
 }
+
+// A refused agent evidence quota is reported as such (REST 402 with the platform's code), not as a
+// sealing failure; nothing is sealed and the run stops without skipping a seq.
+func TestQuotaExceeded_IsReportedAsQuota(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/seal/certificates":
+			json.NewEncoder(w).Encode([]map[string]any{{"id": platformCertID, "source": "platform", "status": "active"}})
+		case "/seal/sign-hashes":
+			w.WriteHeader(402)
+			w.Write([]byte(`{"title":"Payment Required","code":"agent_evidence_quota_exceeded","limit":1000,"resetsAt":"2026-10-12T06:44:24Z"}`))
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+	rec := newRec(t, srv.URL, nil)
+	sid := "e1000000-0000-4000-8000-000000000001"
+	_, err := hook(t, rec, input{SessionID: sid, HookEventName: "SessionStart", Source: "startup", Cwd: t.TempDir()})
+	if err == nil {
+		t.Fatal("the start must fail")
+	}
+	run, _ := rec.store.Current(sid)
+	if run == nil || !strings.Contains(run.Broken, "agent evidence quota is used up") || !strings.Contains(run.Broken, "2026-10-12T06:44:24Z") {
+		t.Fatalf("broken reason %q", run.Broken)
+	}
+	if strings.Contains(run.Broken, "could not be sealed") {
+		t.Fatal("a refused quota is not a sealing failure")
+	}
+}

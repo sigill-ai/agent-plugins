@@ -75,6 +75,15 @@ func (c *Client) SignHashes(ctx context.Context, envelopeHashHex, envelopeConten
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
 		return nil, &AuthError{fmt.Errorf("Sigill refused the API key (%d)", resp.StatusCode)}
 	}
+	if resp.StatusCode == 402 {
+		var p struct {
+			Code     string `json:"code"`
+			ResetsAt string `json:"resetsAt"`
+		}
+		if json.Unmarshal(data, &p) == nil && p.Code == "agent_evidence_quota_exceeded" {
+			return nil, &QuotaError{ResetsAt: p.ResetsAt}
+		}
+	}
 	if resp.StatusCode/100 != 2 {
 		// Body may echo request fields; keep it short and never include the key.
 		return nil, fmt.Errorf("seal rejected (%d): %.300s", resp.StatusCode, data)
