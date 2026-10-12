@@ -1,0 +1,12 @@
+{
+  "name": "sigill",
+  "interface": { "displayName": "Sigill" },
+  "plugins": [
+    {
+      "name": "sigill",
+      "source": { "source": "local", "path": "./plugins/sigill-evidence" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_USE" },
+      "category": "Productivity"
+    }
+  ]
+}

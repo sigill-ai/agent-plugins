@@ -862,7 +862,7 @@ func TestSessionReference_LinksSegments(t *testing.T) {
 			Extensions map[string]map[string]any `json:"extensions"`
 		}
 		json.Unmarshal(a.Envelope, &env)
-		ref, _ := env.Extensions[extKey]["session"].(string)
+		ref, _ := env.Extensions[host.ExtKey]["session"].(string)
 		if strings.Contains(string(a.Envelope), sid) {
 			t.Fatal("the session id itself must not be in the envelope")
 		}

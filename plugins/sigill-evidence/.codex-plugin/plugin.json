@@ -1,0 +1,15 @@
+{
+  "name": "sigill",
+  "version": "0.2.4",
+  "description": "Records each Codex session as verifiable agent evidence and seals it with Sigill. Prompts, tool arguments and results never leave your machine — only their SHA-256 digests are sealed.",
+  "author": { "name": "Sigill", "url": "https://sigill.ai" },
+  "homepage": "https://sigill.ai",
+  "license": "Apache-2.0",
+  "hooks": "./hooks/codex-hooks.json",
+  "skills": "./codex-skills",
+  "interface": {
+    "displayName": "Sigill",
+    "shortDescription": "Verifiable evidence of every Codex session",
+    "longDescription": "Seals each step of a Codex session — tool calls, results, sub-agents and answers — as Agent Evidence Profiles v1, blind: only digests leave your machine. Sessions appear under Evidence in Sigill and verify offline."
+  }
+}

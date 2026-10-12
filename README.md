@@ -1,10 +1,10 @@
-# Sigill for Claude Code
+# Sigill for Claude Code and Codex
 
-Record every Claude Code session as **verifiable agent evidence**. The plugin records each
+Record every Claude Code or OpenAI Codex session as **verifiable agent evidence**. The plugin records each
 session as an [Agent Evidence Profiles v1](https://github.com/sigill-ai/sigill-dotnet/blob/main/spec/agent-profiles-common-v1.md)
 run and seals every step with [Sigill](https://sigill.ai):
 
-- **Before:** a control basis (your CLAUDE.md, settings and the recorder's control set) is
+- **Before:** a control basis (your CLAUDE.md or AGENTS.md, settings and the recorder's control set) is
   sealed and timestamped before the agent acts.
 - **During:** every tool call, tool result and model output is signed and chained to the one
   before it, so a recorded step cannot be removed, inserted or reordered without detection.
@@ -28,6 +28,25 @@ metadata (step types, tool names, times, identifiers) — never content.
 /plugin marketplace add sigill-ai/claude-plugins
 /plugin install sigill@sigill
 ```
+
+### Codex
+
+```
+codex plugin marketplace add sigill-ai/claude-plugins
+codex plugin add sigill@sigill
+```
+
+Codex runs a plugin's hooks only after you have reviewed them: start `codex`, run `/hooks`
+and trust the Sigill hooks (again after each plugin update, since the reviewed definition
+changes). Organisations can instead roll the hooks out as managed hooks in
+`requirements.toml`, which need no review. Then ask Codex to *connect to Sigill* — the
+`sigill-connect` skill signs you in (it needs network access, so approve running it outside
+the sandbox). `sigill-status` and `sigill-disconnect` work the same way.
+
+The same recorder runs in both hosts (`SIGILL_HOST=codex` in the Codex hooks), with its own
+connection, data directory (`~/.codex/plugins/data/sigill-sigill`) and agent id
+(`urn:sigill:agent:codex`). Sub-agents started with Codex's `spawn_agent` are recorded as
+bound child runs exactly like Claude Code's.
 
 ## Connect
 

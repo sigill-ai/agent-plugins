@@ -23,7 +23,7 @@ import (
 	"github.com/sigill-ai/claude-plugins/internal/state"
 )
 
-func isAgentTool(tool string) bool { return tool == "Agent" || tool == "Task" }
+func isAgentTool(tool string) bool { return host.IsDelegationTool(tool) }
 
 // hasRoomToDelegate: the delegation, a result for every open delegation including this one, and run_end
 // must all fit in the bundle limit (§4 rule 6). Without room the call is recorded as an ordinary tool_call.
@@ -47,17 +47,8 @@ func safeName(t string) string {
 	return t
 }
 
-// subagentType is the Agent tool's subagent_type (a role name from configuration, never the task).
-func subagentType(toolInput json.RawMessage) string {
-	var in struct {
-		SubagentType string `json:"subagent_type"`
-	}
-	_ = json.Unmarshal(toolInput, &in)
-	if in.SubagentType == "" {
-		return "general-purpose"
-	}
-	return in.SubagentType
-}
+// subagentType is the configured role of the sub-agent a delegation starts (never the task); see hostProfile.
+func subagentType(toolInput json.RawMessage) string { return host.SubagentType(toolInput) }
 
 // delegate seals the `delegation` declaring a child run, before the sub-agent exists (§4 rule 1).
 func (r *recorder) delegate(ctx context.Context, run *state.Run, in input, ext map[string]any) error {
@@ -108,7 +99,7 @@ func (r *recorder) startChild(ctx context.Context, main *state.Run, in input) er
 			continue
 		}
 		for i, d := range run.Delegations {
-			if d.Committed(run) && d.ChildRun == "" && !d.Resolved(run) && d.SubagentType == in.AgentType {
+			if d.Committed(run) && d.ChildRun == "" && !d.Resolved(run) && d.SubagentType == host.SubagentTypeOf(in.AgentType) {
 				candidates++
 				parent, idx = run, i
 			}
@@ -361,9 +352,9 @@ func (r *recorder) checkPairing(ctx context.Context, run *state.Run, in input) e
 		if d.UseID != in.ToolUseID || d.ClaudeAgentID == "" || d.ClaudeAgentID == resp.AgentID {
 			continue
 		}
-		logf(r.store, "run %s: sub-agent pairing contradiction for %s (bound %s, Claude Code reports %s)",
-			run.Name, in.ToolUseID, d.ClaudeAgentID, resp.AgentID)
-		detail := fmt.Sprintf("capture-fidelity: delegation seq %d paired with a different sub-agent than Claude Code reports", d.Seq)
+		logf(r.store, "run %s: sub-agent pairing contradiction for %s (bound %s, %s reports %s)",
+			run.Name, in.ToolUseID, d.ClaudeAgentID, host.DisplayName, resp.AgentID)
+		detail := fmt.Sprintf("capture-fidelity: delegation seq %d paired with a different sub-agent than %s reports", d.Seq, host.DisplayName)
 		run.PairingStopped = true
 		run.FidelityIssue = detail // the run will close "aborted" with this detail, whatever else happens
 		// The checkpoint must not use the slots reserved for results and run_end (§4 rule 6). Without room the

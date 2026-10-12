@@ -1,0 +1,13 @@
+{
+  "description": "Sigill evidence recorder (Codex)",
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "SIGILL_HOST=codex CLAUDE_PLUGIN_DATA=\"${PLUGIN_DATA}\" \"${PLUGIN_ROOT}/libexec/sigill-hook\"", "timeout": 60 }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "SIGILL_HOST=codex CLAUDE_PLUGIN_DATA=\"${PLUGIN_DATA}\" \"${PLUGIN_ROOT}/libexec/sigill-hook\"", "timeout": 60 }] }],
+    "PreToolUse": [{ "hooks": [{ "type": "command", "command": "SIGILL_HOST=codex CLAUDE_PLUGIN_DATA=\"${PLUGIN_DATA}\" \"${PLUGIN_ROOT}/libexec/sigill-hook\"", "timeout": 60 }] }],
+    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "SIGILL_HOST=codex CLAUDE_PLUGIN_DATA=\"${PLUGIN_DATA}\" \"${PLUGIN_ROOT}/libexec/sigill-hook\"", "timeout": 60 }] }],
+    "SubagentStart": [{ "hooks": [{ "type": "command", "command": "SIGILL_HOST=codex CLAUDE_PLUGIN_DATA=\"${PLUGIN_DATA}\" \"${PLUGIN_ROOT}/libexec/sigill-hook\"", "timeout": 60 }] }],
+    "SubagentStop": [{ "hooks": [{ "type": "command", "command": "SIGILL_HOST=codex CLAUDE_PLUGIN_DATA=\"${PLUGIN_DATA}\" \"${PLUGIN_ROOT}/libexec/sigill-hook\"", "timeout": 60 }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "SIGILL_HOST=codex CLAUDE_PLUGIN_DATA=\"${PLUGIN_DATA}\" \"${PLUGIN_ROOT}/libexec/sigill-hook\"", "timeout": 60 }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "SIGILL_HOST=codex CLAUDE_PLUGIN_DATA=\"${PLUGIN_DATA}\" \"${PLUGIN_ROOT}/libexec/sigill-hook\"", "timeout": 3 }] }]
+  }
+}

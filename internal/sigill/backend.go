@@ -144,7 +144,7 @@ func (m *MCPClient) call(ctx context.Context, tool string, args any, out any) er
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	switch {
 	case resp.StatusCode == 401 || resp.StatusCode == 403:
-		return &AuthError{fmt.Errorf("Sigill refused the connection (%d) — run /sigill:connect", resp.StatusCode)}
+		return &AuthError{fmt.Errorf("Sigill refused the connection (%d) — sign in again", resp.StatusCode)}
 	case resp.StatusCode == 429:
 		return &RetryableError{Err: fmt.Errorf("%s throttled", tool), After: retryAfter(resp.Header)}
 	case resp.StatusCode != 200:

@@ -137,7 +137,10 @@ func TestR6AccessTokenHonorsCallerDeadline(t *testing.T) {
 		name string
 		fn   func(context.Context) error
 	}{
-		{"AccessToken", func(ctx context.Context) error { _, _, err := m.AccessToken(ctx, "https://example.invalid"); return err }},
+		{"AccessToken", func(ctx context.Context) error {
+			_, _, err := m.AccessToken(ctx, "https://example.invalid")
+			return err
+		}},
 		{"save", func(ctx context.Context) error { return m.save(ctx, &Credential{Issuer: "https://example.invalid"}) }},
 		{"Disconnect", func(ctx context.Context) error { return m.Disconnect(ctx) }},
 	} {

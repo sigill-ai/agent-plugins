@@ -366,7 +366,7 @@ func secretToolResult(out, stderr []byte, err error) ([]byte, error) {
 
 func (s *secretService) Set(b []byte) error {
 	_, _, err := helper(s.ctx, strings.NewReader(base64.StdEncoding.EncodeToString(b)), secretToolBin,
-		"store", "--label=Sigill for Claude Code", "service", keychainService, "account", s.account)
+		"store", "--label=Sigill for "+HostName, "service", keychainService, "account", s.account)
 	return err
 }
 

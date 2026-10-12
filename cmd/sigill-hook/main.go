@@ -35,10 +35,7 @@ import (
 )
 
 const (
-	recorderID   = "urn:sigill:recorder:claude-code"
 	activityName = "agent-session" // fixed and neutral: Sigill must not learn what a session is about
-	controlSetID = "sigill-claude-code-baseline"
-	extKey       = "ai.sigill.claude-code"
 
 	// maxEvents is the portable bundle limit (common rules §7). Ordinary events stop at
 	// maxEvents-1 so run_end always fits as the last one.
@@ -90,13 +87,13 @@ func loadConfig() config {
 	data := os.Getenv("CLAUDE_PLUGIN_DATA")
 	if data == "" {
 		home, _ := os.UserHomeDir()
-		data = filepath.Join(home, ".sigill", "claude-code")
+		data = host.DefaultDataDir(home)
 	}
 	c := config{
 		APIURL:        envOr("SIGILL_API_URL", "https://api.sigill.ai"),
 		APIKey:        os.Getenv("SIGILL_API_KEY"),
 		CertificateID: os.Getenv("SIGILL_CERTIFICATE_ID"),
-		AgentID:       envOr("SIGILL_AGENT_ID", "urn:sigill:agent:claude-code"),
+		AgentID:       envOr("SIGILL_AGENT_ID", host.DefaultAgentID),
 		DataDir:       data,
 		FailClosed:    os.Getenv("SIGILL_FAIL_CLOSED") == "1",
 		Index:         os.Getenv("SIGILL_INDEX") != "0", // the producer decides; default: upload signed envelopes
@@ -127,7 +124,7 @@ func loadConfig() config {
 			}
 		}
 	}
-	tools := envOr("SIGILL_CONSEQUENTIAL_TOOLS", "Bash,Write,Edit,MultiEdit,NotebookEdit,mcp__*")
+	tools := envOr("SIGILL_CONSEQUENTIAL_TOOLS", host.DefaultConsequential)
 	for _, t := range strings.Split(tools, ",") {
 		if t = strings.TrimSpace(t); t != "" {
 			c.Consequential[t] = true
@@ -156,6 +153,7 @@ func (c config) isConsequential(tool string) bool {
 }
 
 func main() {
+	auth.SetHost(host.DisplayName, host.ConnectCommand, host.ClientID)
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "export":
@@ -333,7 +331,7 @@ func (r *recorder) handle(ctx context.Context, in input) (*state.Run, error) {
 		case child != nil:
 			target = child
 		default:
-			ext[extKey] = map[string]any{"agentId": in.AgentID, "agentType": in.AgentType}
+			ext[host.ExtKey] = map[string]any{"agentId": in.AgentID, "agentType": in.AgentType}
 		}
 	}
 
@@ -478,7 +476,7 @@ func (r *recorder) newRun(ctx context.Context, in input, segmentOf string, paren
 		Name:          now.UTC().Format("20060102T150405Z") + "-" + uuid[:8],
 		CorrelationID: "urn:uuid:" + uuid,
 		AgentID:       r.cfg.AgentID,
-		AgentVersion:  claudeVersion(ctx),
+		AgentVersion:  hostVersion(ctx),
 		Policy:        evidence.TimestampPolicy{Profile: "throughput", Consequential: true},
 		URIs:          map[string]string{},
 		StartedAt:     now,
@@ -514,19 +512,20 @@ func (r *recorder) newRun(ctx context.Context, in input, segmentOf string, paren
 	if err := newDir(run); err != nil {
 		return nil, err
 	}
-	instructions := collect(in.Cwd, []string{"CLAUDE.md", ".claude/CLAUDE.md"}, ".claude/CLAUDE.md")
+	instructions := collect(in.Cwd, host.InstructionFiles, host.InstructionDefault)
 	if d != nil {
 		// A sub-agent's instruction set is its definition file (custom agents); built-in types have none.
-		def := filepath.Join(".claude", "agents", safeName(d.SubagentType)+".md")
-		instructions = collect(in.Cwd, []string{def}, def)
+		if def := host.AgentDefinition(d.SubagentType); def != "" {
+			instructions = collect(in.Cwd, []string{def}, def)
+		}
 	}
 	objs := []evidence.Object{
 		evidence.NewObject("instruction-set", "text/markdown", instructions),
-		evidence.NewObject("execution-policy", "application/json", collect(in.Cwd, []string{".claude/settings.json", ".claude/settings.local.json"}, ".claude/settings.json")),
+		evidence.NewObject("execution-policy", "application/json", collect(in.Cwd, host.SettingsFiles, host.SettingsDefault)),
 		evidence.NewObject("control-set", "application/json", baselineControlSet(r.cfg)),
 	}
-	env := evidence.ControlArtifact(now, evidence.Actor{Type: "system", ID: recorderID, Version: sigill.Version},
-		activityName, run.CorrelationID, run.AgentID, run.AgentVersion, controlSetID, "1", run.Policy, objs)
+	env := evidence.ControlArtifact(now, evidence.Actor{Type: "system", ID: host.RecorderID, Version: sigill.Version},
+		activityName, run.CorrelationID, run.AgentID, run.AgentVersion, host.ControlSetID, "1", run.Policy, objs)
 	if err := r.commitSealed(ctx, run, env, evidence.ControlArtifactContentType, objs, true, state.Pending{Name: "ctrl", Seq: -1}); err != nil {
 		return run, err
 	}
@@ -539,7 +538,7 @@ func (r *recorder) newRun(ctx context.Context, in input, segmentOf string, paren
 	if segmentOf != "" {
 		src["segmentOf"] = segmentOf
 	}
-	return run, r.seal(ctx, run, "run_start", nil, false, false, map[string]any{extKey: src}, nil)
+	return run, r.seal(ctx, run, "run_start", nil, false, false, map[string]any{host.ExtKey: src}, nil)
 }
 
 // seal builds the next chain event and commits it.
@@ -1003,7 +1002,10 @@ func operation(tool string) string {
 		return "write"
 	case "Bash":
 		return "execute"
-	case "Agent", "Task":
+	case "apply_patch":
+		return "write"
+	}
+	if host.IsDelegationTool(tool) {
 		return "delegate"
 	}
 	return ""
@@ -1100,21 +1102,22 @@ func baselineControlSet(cfg config) []byte {
 	}
 	sort.Strings(tools)
 	out, _ := json.Marshal(map[string]any{
-		"id": controlSetID, "version": "1",
+		"id": host.ControlSetID, "version": "1",
 		"description":        "Recorder baseline: every tool call and result is sealed in capture order; consequential tools are timestamped before they run.",
 		"consequentialTools": tools,
 	})
 	return out
 }
 
-func claudeVersion(ctx context.Context) string {
+func hostVersion(ctx context.Context) string {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "claude", "--version").Output()
+	out, err := exec.CommandContext(ctx, host.VersionCommand[0], host.VersionCommand[1:]...).Output()
 	if err != nil {
 		return "unknown"
 	}
-	return strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(string(out)), "(Claude Code)"))
+	v := strings.TrimSpace(string(out))
+	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSuffix(v, host.VersionTrim), host.VersionTrim))
 }
 
 // logf writes a diagnostic line. Lines carry ids, step names and status codes only —
@@ -1229,9 +1232,9 @@ func cmdStatus() int {
 		cred, _ := m.Current()
 		switch {
 		case cred == nil:
-			fmt.Println("auth: not connected — run /sigill:connect")
+			fmt.Println("auth: not connected — run " + auth.ConnectCommand)
 		case cred.Uncertain != "":
-			fmt.Printf("auth: Sigill sign-in, needs renewal (%s) — run /sigill:connect\n", cred.Uncertain)
+			fmt.Printf("auth: Sigill sign-in, needs renewal (%s) — run %s\n", cred.Uncertain, auth.ConnectCommand)
 		default:
 			fmt.Printf("auth: Sigill sign-in, organisation %s, connected %s, stored in %s\n",
 				cred.TenantID, cred.ConnectedAt.Format("2006-01-02"), m.Store.Name())
@@ -1336,7 +1339,7 @@ func connectHint(store state.Store, err error) {
 	if !store.Once("connect-hint", 24*time.Hour) {
 		return
 	}
-	msg := "Sigill: this session is not being recorded — run /sigill:connect to sign in."
+	msg := "Sigill: this session is not being recorded — run " + auth.ConnectCommand + " to sign in."
 	if !errors.Is(err, auth.ErrNotConnected) {
 		msg = "Sigill: this session is not being recorded — " + err.Error()
 	}

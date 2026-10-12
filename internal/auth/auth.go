@@ -38,8 +38,9 @@ import (
 const (
 	// Scope requested by the recorder: agent recording + refresh, nothing else.
 	Scope = "mcp:agent:record offline_access"
-	// DefaultClientID is Sigill's published client metadata document (CIMD).
-	DefaultClientID = "https://sigill.ai/.well-known/oauth-client/claude-code.json"
+	// defaultClientID is Sigill's published client metadata document (CIMD) for Claude Code; a host sets
+	// its own with SetHost.
+	defaultClientID = "https://sigill.ai/.well-known/oauth-client/claude-code.json"
 	// refreshMargin: refresh an access token that expires within this window.
 	refreshMargin = 5 * time.Minute
 )
@@ -67,7 +68,7 @@ type Credential struct {
 func (c *Credential) Account() string { return c.Issuer + "|" + c.TenantID + "|" + c.Subject }
 
 // ErrNotConnected: no usable credential; the user must run `sigill-hook connect`.
-var ErrNotConnected = errors.New("not connected to Sigill — run /sigill:connect")
+var ErrNotConnected = errors.New("not connected to Sigill")
 
 // Manager owns the credential for one plugin data directory.
 type Manager struct {
@@ -120,6 +121,19 @@ func sameOrigin(u, issuer string) bool {
 	a, err1 := url.Parse(u)
 	b, err2 := url.Parse(issuer)
 	return err1 == nil && err2 == nil && a.Scheme == b.Scheme && a.Host == b.Host
+}
+
+// The host the recorder runs in: its name on the sign-in page and in the client registration, the command
+// a user runs to (re)connect, and its client metadata document.
+var (
+	HostName        = "Claude Code"
+	ConnectCommand  = "/sigill:connect"
+	DefaultClientID = defaultClientID
+)
+
+// SetHost names the host for user-facing text and selects its OAuth client.
+func SetHost(name, connectCommand, clientID string) {
+	HostName, ConnectCommand, DefaultClientID = name, connectCommand, clientID
 }
 
 // ── Connect (interactive) ──────────────────────────────────────────────────
@@ -201,9 +215,9 @@ func (m *Manager) Connect(ctx context.Context, o ConnectOptions) (*Credential, e
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if res.err != nil {
-			fmt.Fprint(w, page("Sigill was not connected", "You can close this tab and run /sigill:connect again."))
+			fmt.Fprint(w, page("Sigill was not connected", "You can close this tab and run "+ConnectCommand+" again."))
 		} else {
-			fmt.Fprint(w, page("Claude Code is connected to Sigill", "You can close this tab and return to Claude Code."))
+			fmt.Fprint(w, page(HostName+" is connected to Sigill", "You can close this tab and return to "+HostName+"."))
 		}
 		select {
 		case done <- res:
@@ -270,7 +284,7 @@ func (m *Manager) register(ctx context.Context, md *metadata, issuer string) (st
 		return "", errors.New("the server does not offer client registration")
 	}
 	body, _ := json.Marshal(map[string]any{
-		"client_name": "Sigill for Claude Code", "redirect_uris": []string{"http://127.0.0.1/callback"},
+		"client_name": "Sigill for " + HostName, "redirect_uris": []string{"http://127.0.0.1/callback"},
 		"grant_types": []string{"authorization_code", "refresh_token"}, "token_endpoint_auth_method": "none",
 	})
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, md.RegistrationEndpoint, strings.NewReader(string(body)))
@@ -362,17 +376,17 @@ func (m *Manager) AccessToken(ctx context.Context, issuer string) (string, *Cred
 	cred, err := m.load(ctx)
 	if err != nil {
 		// An ambiguous or unavailable store is never guessed at: the user reconnects.
-		return "", nil, fmt.Errorf("%v — run /sigill:connect", err)
+		return "", nil, fmt.Errorf("%v — run %s", err, ConnectCommand)
 	}
 	if cred == nil {
 		return "", nil, ErrNotConnected
 	}
 	if cred.Issuer != issuer {
 		// Pinned: never send this credential to another server.
-		return "", nil, fmt.Errorf("connected to %s, not %s — run /sigill:connect for this server", cred.Issuer, issuer)
+		return "", nil, fmt.Errorf("connected to %s, not %s — run %s for this server", cred.Issuer, issuer, ConnectCommand)
 	}
 	if cred.Uncertain != "" {
-		return "", cred, fmt.Errorf("the Sigill connection needs to be renewed (%s) — run /sigill:connect", cred.Uncertain)
+		return "", cred, fmt.Errorf("the Sigill connection needs to be renewed (%s) — run %s", cred.Uncertain, ConnectCommand)
 	}
 	if time.Until(cred.AccessExpiry) > refreshMargin {
 		return cred.AccessToken, cred, nil
@@ -434,7 +448,7 @@ func (m *Manager) AccessToken(ctx context.Context, issuer string) (string, *Cred
 		return "", cred, err
 	}
 	if cred.Uncertain != "" {
-		return "", cred, fmt.Errorf("the Sigill connection needs to be renewed (%s) — run /sigill:connect", cred.Uncertain)
+		return "", cred, fmt.Errorf("the Sigill connection needs to be renewed (%s) — run %s", cred.Uncertain, ConnectCommand)
 	}
 	return cred.AccessToken, cred, nil
 }
