@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sigill-ai/claude-plugins/internal/evidence"
-	"github.com/sigill-ai/claude-plugins/internal/state"
+	"github.com/sigill-ai/agent-plugins/internal/evidence"
+	"github.com/sigill-ai/agent-plugins/internal/state"
 )
 
 type tev struct {

@@ -1,4 +1,4 @@
-module github.com/sigill-ai/claude-plugins
+module github.com/sigill-ai/agent-plugins
 
 go 1.23
 

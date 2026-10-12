@@ -28,10 +28,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/sigill-ai/claude-plugins/internal/auth"
-	"github.com/sigill-ai/claude-plugins/internal/evidence"
-	"github.com/sigill-ai/claude-plugins/internal/sigill"
-	"github.com/sigill-ai/claude-plugins/internal/state"
+	"github.com/sigill-ai/agent-plugins/internal/auth"
+	"github.com/sigill-ai/agent-plugins/internal/evidence"
+	"github.com/sigill-ai/agent-plugins/internal/sigill"
+	"github.com/sigill-ai/agent-plugins/internal/state"
 )
 
 const (
@@ -202,6 +202,9 @@ func runHook() int {
 	store := state.Store{Dir: cfg.DataDir}
 	ctx, cancel := context.WithDeadline(context.Background(), hookStart.Add(hookBudget-persistSlack))
 	defer cancel()
+	if in.HookEventName == "SessionStart" {
+		markHooksActive(cfg.DataDir) // for status: the host really runs our hooks (Codex needs them reviewed)
+	}
 	if in.HookEventName == "SessionEnd" {
 		// Claude Code keeps SessionEnd short: the close intent is made durable first, locally, with no
 		// credential, keychain or network work; the detached finalizer resolves credentials and seals.
@@ -1242,6 +1245,9 @@ func cmdStatus() int {
 	}
 	fmt.Printf("certificate: %s\nagent: %s\ndata: %s\nfail-closed: %v\nindex upload: %v\nqualified timestamps: %v\n",
 		certText(cfg.CertificateID), cfg.AgentID, cfg.DataDir, cfg.FailClosed, cfg.Index, cfg.Qualified)
+	if host.Name == "codex" {
+		fmt.Println(codexHooksStatus(cfg.DataDir))
+	}
 	store := state.Store{Dir: cfg.DataDir}
 	for _, key := range store.SessionKeys() {
 		for _, name := range store.PendingCloseRunsForKey(key) {

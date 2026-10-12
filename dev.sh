@@ -30,7 +30,7 @@ local)
 	arch=$(uname -m); case "$arch" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; esac
 	in_volume "VERSION=\$(sed -n 's/.*\"version\": \"\\(.*\\)\".*/\\1/p' plugins/sigill-evidence/.claude-plugin/plugin.json) && \
 		CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -buildvcs=false \
-		-ldflags \"-s -w -buildid= -X github.com/sigill-ai/claude-plugins/internal/sigill.Version=\$VERSION\" \
+		-ldflags \"-s -w -buildid= -X github.com/sigill-ai/agent-plugins/internal/sigill.Version=\$VERSION\" \
 		-o /out/sigill-hook-$os-$arch ./cmd/sigill-hook" "-v $PWD/$LIBEXEC:/out"
 	echo "built $LIBEXEC/sigill-hook-$os-$arch (do not commit; CI builds the shipped binaries)" ;;
 shell) in_volume 'sh' "-t" ;;

@@ -25,14 +25,14 @@ metadata (step types, tool names, times, identifiers) — never content.
 ## Install
 
 ```
-/plugin marketplace add sigill-ai/claude-plugins
+/plugin marketplace add sigill-ai/agent-plugins
 /plugin install sigill@sigill
 ```
 
 ### Codex
 
 ```
-codex plugin marketplace add sigill-ai/claude-plugins
+codex plugin marketplace add sigill-ai/agent-plugins
 codex plugin add sigill@sigill
 ```
 
@@ -42,6 +42,76 @@ changes). Organisations can instead roll the hooks out as managed hooks in
 `requirements.toml`, which need no review. Then ask Codex to *connect to Sigill* — the
 `sigill-connect` skill signs you in (it needs network access, so approve running it outside
 the sandbox). `sigill-status` and `sigill-disconnect` work the same way.
+
+Run the `sigill-status` skill at any time: it tells you whether Codex is actually running the
+Sigill hooks (a session start was recorded) and, if not, what to do.
+
+#### Rolling it out to an organisation (no review step)
+
+Hooks defined by an administrator in Codex's `requirements.toml` are trusted by policy: developers
+review nothing and cannot switch them off. Install the recorder in a fixed directory with your
+device management (copy `plugins/sigill-evidence/libexec/` — the `sigill-hook` launcher, the
+`sigill-hook-<os>-<arch>` binaries and `SHA256SUMS`, checked with `shasum -a 256 -c SHA256SUMS` —
+to `/opt/sigill`), then add:
+
+```toml
+allow_managed_hooks_only = true   # recommended: never record a session twice (managed + plugin hooks)
+
+[hooks]
+managed_dir = "/opt/sigill"
+
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "SIGILL_HOST=codex /opt/sigill/sigill-hook"
+timeout = 60
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "SIGILL_HOST=codex /opt/sigill/sigill-hook"
+timeout = 60
+
+[[hooks.PreToolUse]]
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "SIGILL_HOST=codex /opt/sigill/sigill-hook"
+timeout = 60
+
+[[hooks.PostToolUse]]
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "SIGILL_HOST=codex /opt/sigill/sigill-hook"
+timeout = 60
+
+[[hooks.SubagentStart]]
+[[hooks.SubagentStart.hooks]]
+type = "command"
+command = "SIGILL_HOST=codex /opt/sigill/sigill-hook"
+timeout = 60
+
+[[hooks.SubagentStop]]
+[[hooks.SubagentStop.hooks]]
+type = "command"
+command = "SIGILL_HOST=codex /opt/sigill/sigill-hook"
+timeout = 60
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "SIGILL_HOST=codex /opt/sigill/sigill-hook"
+timeout = 60
+
+[[hooks.SessionEnd]]
+[[hooks.SessionEnd.hooks]]
+type = "command"
+command = "SIGILL_HOST=codex /opt/sigill/sigill-hook"
+timeout = 3
+```
+
+Developers connect once with `SIGILL_HOST=codex /opt/sigill/sigill-hook connect` (or the
+`sigill-connect` skill, if you also install the plugin for its skills). Settings such as
+`SIGILL_CERTIFICATE_ID` or `SIGILL_QUALIFIED=1` go in front of the command in the same way.
 
 The same recorder runs in both hosts (`SIGILL_HOST=codex` in the Codex hooks), with its own
 connection, data directory (`~/.codex/plugins/data/sigill-sigill`) and agent id

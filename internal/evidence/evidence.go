@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sigill-ai/claude-plugins/internal/jcs"
+	"github.com/sigill-ai/agent-plugins/internal/jcs"
 )
 
 const (

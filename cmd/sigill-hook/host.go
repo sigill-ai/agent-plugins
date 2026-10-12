@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // hostProfile is what differs between the agent hosts the recorder runs in. The hook protocol is the same
@@ -123,4 +125,53 @@ func hostFromEnv() hostProfile {
 		return codexHost
 	}
 	return claudeCodeHost
+}
+
+// hooksMarker records the last SessionStart the host delivered to us. It is the one reliable signal that
+// the host really runs the recorder's hooks: Codex skips plugin hooks until the user has reviewed them
+// (/hooks), again after each plugin update, and says nothing about it.
+const hooksMarker = "hooks-last-session-start"
+
+func markHooksActive(dataDir string) {
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(dataDir, hooksMarker), []byte(time.Now().UTC().Format(time.RFC3339)), 0o600)
+}
+
+// codexEvents are the events hooks/codex-hooks.json registers, as Codex names them in its review state.
+var codexEvents = []string{"session_start", "user_prompt_submit", "pre_tool_use", "post_tool_use",
+	"subagent_start", "subagent_stop", "stop", "session_end"}
+
+// codexHooksStatus explains whether Codex runs the Sigill hooks. Reviewed hooks are listed in Codex's
+// config as hooks.state."sigill@sigill:hooks/codex-hooks.json:<event>:…"; managed hooks (requirements.toml)
+// need no review and do not appear there, so the session-start marker is the deciding signal.
+func codexHooksStatus(dataDir string) string {
+	last := ""
+	if b, err := os.ReadFile(filepath.Join(dataDir, hooksMarker)); err == nil {
+		last = strings.TrimSpace(string(b))
+	}
+	home := os.Getenv("CODEX_HOME")
+	if home == "" {
+		h, _ := os.UserHomeDir()
+		home = filepath.Join(h, ".codex")
+	}
+	reviewed := 0
+	if cfg, err := os.ReadFile(filepath.Join(home, "config.toml")); err == nil {
+		for _, ev := range codexEvents {
+			if strings.Contains(string(cfg), `hooks.state."sigill@sigill:hooks/codex-hooks.json:`+ev+`:`) {
+				reviewed++
+			}
+		}
+	}
+	const fix = "start codex, run /hooks and press t to trust the Sigill hooks (needed again after each plugin update)"
+	switch {
+	case last != "":
+		return fmt.Sprintf("hooks: active — last session start recorded %s (%d of %d reviewed in your Codex config). If a session started after that was not recorded, %s.",
+			last, reviewed, len(codexEvents), fix)
+	case reviewed < len(codexEvents):
+		return fmt.Sprintf("hooks: NOT RUNNING — Codex skips plugin hooks until they are reviewed (%d of %d reviewed): %s.", reviewed, len(codexEvents), fix)
+	default:
+		return "hooks: reviewed, but no session has started since — start a new Codex session."
+	}
 }

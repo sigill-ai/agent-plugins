@@ -9,7 +9,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/sigill-ai/claude-plugins/internal/evidence/evidencetest"
+	"github.com/sigill-ai/agent-plugins/internal/evidence/evidencetest"
 )
 
 // sealWith wraps a token in a JWS the way the platform returns a timestamped seal.

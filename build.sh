@@ -16,7 +16,7 @@ fi
 for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64; do
   os=${target%/*}; arch=${target#*/}
   CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -buildvcs=false \
-    -ldflags "-s -w -buildid= -X github.com/sigill-ai/claude-plugins/internal/sigill.Version=$VERSION" \
+    -ldflags "-s -w -buildid= -X github.com/sigill-ai/agent-plugins/internal/sigill.Version=$VERSION" \
     -o "$OUT/sigill-hook-$os-$arch" ./cmd/sigill-hook
 done
 (cd "$OUT" && sha256sum sigill-hook-*-* > SHA256SUMS 2>/dev/null || shasum -a 256 sigill-hook-*-* > SHA256SUMS)

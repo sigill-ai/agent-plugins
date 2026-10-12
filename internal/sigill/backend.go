@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sigill-ai/claude-plugins/internal/evidence"
+	"github.com/sigill-ai/agent-plugins/internal/evidence"
 )
 
 // Backend is how the recorder reaches Sigill: REST with an API key (headless CI) or the

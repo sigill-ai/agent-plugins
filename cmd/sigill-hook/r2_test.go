@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sigill-ai/claude-plugins/internal/state"
+	"github.com/sigill-ai/agent-plugins/internal/state"
 )
 
 // runHookWith feeds one event to runHook the way Claude Code does (stdin), with the given environment.

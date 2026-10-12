@@ -31,7 +31,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/sigill-ai/claude-plugins/internal/evidence"
+	"github.com/sigill-ai/agent-plugins/internal/evidence"
 )
 
 // Run is the persisted chain state of one recorded run. It never holds content:

@@ -17,10 +17,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sigill-ai/claude-plugins/internal/evidence"
-	"github.com/sigill-ai/claude-plugins/internal/evidence/evidencetest"
-	"github.com/sigill-ai/claude-plugins/internal/sigill"
-	"github.com/sigill-ai/claude-plugins/internal/state"
+	"github.com/sigill-ai/agent-plugins/internal/evidence"
+	"github.com/sigill-ai/agent-plugins/internal/evidence/evidencetest"
+	"github.com/sigill-ai/agent-plugins/internal/sigill"
+	"github.com/sigill-ai/agent-plugins/internal/state"
 )
 
 const platformCertID = "22222222-2222-2222-2222-222222222222"

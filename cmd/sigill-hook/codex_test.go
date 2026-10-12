@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/sigill-ai/claude-plugins/internal/evidence"
+	"github.com/sigill-ai/agent-plugins/internal/evidence"
 )
 
 func asCodex(t *testing.T) {
@@ -119,5 +121,27 @@ func TestCodex_HostProfile(t *testing.T) {
 	}
 	if operation("apply_patch") != "write" {
 		t.Fatal("apply_patch is a write")
+	}
+}
+
+func TestCodex_HooksStatus(t *testing.T) {
+	data, home := t.TempDir(), t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	if got := codexHooksStatus(data); !strings.Contains(got, "NOT RUNNING") || !strings.Contains(got, "0 of 8") {
+		t.Fatalf("no review, no marker: %s", got)
+	}
+	cfg := ""
+	for _, ev := range codexEvents {
+		cfg += `[hooks.state."sigill@sigill:hooks/codex-hooks.json:` + ev + `:0:0"]` + "\ntrusted_hash = \"sha256:x\"\n"
+	}
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := codexHooksStatus(data); !strings.Contains(got, "no session has started") {
+		t.Fatalf("reviewed, no marker: %s", got)
+	}
+	markHooksActive(data)
+	if got := codexHooksStatus(data); !strings.Contains(got, "active") || !strings.Contains(got, "8 of 8") {
+		t.Fatalf("marker present: %s", got)
 	}
 }

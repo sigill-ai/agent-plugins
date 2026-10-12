@@ -19,8 +19,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sigill-ai/claude-plugins/internal/evidence"
-	"github.com/sigill-ai/claude-plugins/internal/state"
+	"github.com/sigill-ai/agent-plugins/internal/evidence"
+	"github.com/sigill-ai/agent-plugins/internal/state"
 )
 
 func isAgentTool(tool string) bool { return host.IsDelegationTool(tool) }

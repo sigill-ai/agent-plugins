@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sigill-ai/claude-plugins/internal/evidence"
+	"github.com/sigill-ai/agent-plugins/internal/evidence"
 )
 
 type Client struct {
