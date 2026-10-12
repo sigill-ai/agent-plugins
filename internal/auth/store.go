@@ -2,16 +2,19 @@ package auth
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // SecretStore keeps one secret (the serialized credential) for this installation.
@@ -26,6 +29,33 @@ const (
 	keychainService = "ai.sigill.claude-code"
 )
 
+// Credential I/O is bounded: an OS helper that stalls (a keychain prompt nobody answers, a hung D-Bus) is
+// killed after helperTimeout and reported as a failure — never as "no credential" — so every caller keeps
+// its uncertainty semantics (an unreadable authority stays unreadable; a refresh whose result cannot be
+// stored stays uncertain) and the hook still finishes within its deadline.
+var (
+	helperTimeout = 10 * time.Second
+	securityBin   = "security"
+	secretToolBin = "secret-tool"
+)
+
+// helper runs an OS credential helper under helperTimeout. WaitDelay closes its pipes shortly after the
+// kill, so a helper whose descendants keep stdout open cannot hold Run past the deadline.
+func helper(stdin io.Reader, name string, args ...string) (out, stderr []byte, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), helperTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = time.Second
+	cmd.Stdin = stdin
+	var o, e bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &o, &e
+	err = cmd.Run()
+	if ctx.Err() != nil {
+		err = fmt.Errorf("%s did not answer within %s", name, helperTimeout)
+	}
+	return o.Bytes(), e.Bytes(), err
+}
+
 // DefaultStore returns the installation's credential store. Every mode — OS keychain, Secret Service,
 // private file only (SIGILL_CREDENTIAL_STORE=file, or no keychain usable in this invocation) — goes through
 // one authority protocol (see authority), so switching between them can never read a stale copy.
@@ -37,11 +67,11 @@ func DefaultStore(dir string) SecretStore {
 	switch runtime.GOOS {
 	case "darwin":
 		a.osPrimary, a.primary = "keychain", &macKeychain{account: "default:" + dir} // one credential per data directory
-		_, err := exec.LookPath("security")
+		_, err := exec.LookPath(securityBin)
 		a.readOnlyPrimary = err != nil
 	case "linux":
 		a.osPrimary, a.primary = "secret-service", &secretService{account: "default:" + dir}
-		_, err := exec.LookPath("secret-tool")
+		_, err := exec.LookPath(secretToolBin)
 		a.readOnlyPrimary = err != nil || os.Getenv("DBUS_SESSION_BUS_ADDRESS") == ""
 	}
 	if os.Getenv("SIGILL_CREDENTIAL_STORE") == "file" {
@@ -248,7 +278,7 @@ type macKeychain struct{ account string }
 func (k *macKeychain) Name() string { return "macOS Keychain" }
 
 func (k *macKeychain) Get() ([]byte, error) {
-	out, err := exec.Command("security", "find-generic-password", "-s", keychainService, "-a", k.account, "-w").Output()
+	out, _, err := helper(nil, securityBin, "find-generic-password", "-s", keychainService, "-a", k.account, "-w")
 	return keychainResult(out, err)
 }
 
@@ -269,19 +299,16 @@ func keychainResult(out []byte, err error) ([]byte, error) {
 }
 
 func (k *macKeychain) Set(b []byte) error {
-	cmd := exec.Command("security", "-i")
-	cmd.Stdin = strings.NewReader(fmt.Sprintf("add-generic-password -U -s %s -a %s -w %s\n",
-		quote(keychainService), quote(k.account), base64.StdEncoding.EncodeToString(b)))
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil || strings.Contains(stderr.String(), "error") {
+	_, stderr, err := helper(strings.NewReader(fmt.Sprintf("add-generic-password -U -s %s -a %s -w %s\n",
+		quote(keychainService), quote(k.account), base64.StdEncoding.EncodeToString(b))), securityBin, "-i")
+	if err != nil || strings.Contains(string(stderr), "error") {
 		return errors.New("the macOS Keychain refused the credential")
 	}
 	return nil
 }
 
 func (k *macKeychain) Delete() error {
-	_ = exec.Command("security", "delete-generic-password", "-s", keychainService, "-a", k.account).Run()
+	_, _, _ = helper(nil, securityBin, "delete-generic-password", "-s", keychainService, "-a", k.account)
 	return nil
 }
 
@@ -291,11 +318,8 @@ type secretService struct{ account string }
 func (s *secretService) Name() string { return "Secret Service" }
 
 func (s *secretService) Get() ([]byte, error) {
-	cmd := exec.Command("secret-tool", "lookup", "service", keychainService, "account", s.account)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	return secretToolResult(out, stderr.Bytes(), err)
+	out, stderr, err := helper(nil, secretToolBin, "lookup", "service", keychainService, "account", s.account)
+	return secretToolResult(out, stderr, err)
 }
 
 // secretToolResult maps a `secret-tool lookup` outcome. It exits 1 silently when nothing matches; a failure
@@ -313,13 +337,13 @@ func secretToolResult(out, stderr []byte, err error) ([]byte, error) {
 }
 
 func (s *secretService) Set(b []byte) error {
-	cmd := exec.Command("secret-tool", "store", "--label=Sigill for Claude Code", "service", keychainService, "account", s.account)
-	cmd.Stdin = strings.NewReader(base64.StdEncoding.EncodeToString(b))
-	return cmd.Run()
+	_, _, err := helper(strings.NewReader(base64.StdEncoding.EncodeToString(b)), secretToolBin,
+		"store", "--label=Sigill for Claude Code", "service", keychainService, "account", s.account)
+	return err
 }
 
 func (s *secretService) Delete() error {
-	_ = exec.Command("secret-tool", "clear", "service", keychainService, "account", s.account).Run()
+	_, _, _ = helper(nil, secretToolBin, "clear", "service", keychainService, "account", s.account)
 	return nil
 }
 
@@ -329,8 +353,10 @@ type FileStore struct{ Path string }
 
 func (f *FileStore) Name() string { return "private file" }
 
+// Get never blocks: with O_NONBLOCK, opening a FIFO or other special file planted at the path returns at
+// once, and anything but a private regular file is rejected before it is read.
 func (f *FileStore) Get() ([]byte, error) {
-	fh, err := os.OpenFile(f.Path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	fh, err := os.OpenFile(f.Path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
@@ -343,8 +369,10 @@ func (f *FileStore) Get() ([]byte, error) {
 		return nil, errors.New("the credential file is not a private regular file")
 	}
 	buf := make([]byte, fi.Size())
-	_, err = fh.Read(buf)
-	return buf, err
+	if _, err := io.ReadFull(fh, buf); err != nil {
+		return nil, errors.New("the credential file could not be read completely")
+	}
+	return buf, nil
 }
 
 func (f *FileStore) Set(b []byte) error {
