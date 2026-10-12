@@ -14,6 +14,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -61,7 +63,124 @@ func (r *recorder) delegate(ctx context.Context, run *state.Run, in input, ext m
 		Seq:                run.NextSeq,
 		ResultSeq:          -1,
 		CreatedAt:          time.Now(),
+		TaskKey:            taskKey(stringField(in.ToolInput, "task_name")),
 	}
+	return r.delegateWith(ctx, run, in, ext, d)
+}
+
+// taskKey is a one-way key of a Codex task name (model-chosen text): kept locally only, to tie a
+// follow-up's target to the delegation that spawned the agent. Empty for an empty name.
+func taskKey(name string) string {
+	if name == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("sigill-codex-task\x00" + name))
+	return hex.EncodeToString(sum[:16])
+}
+
+func stringField(raw json.RawMessage, key string) string {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil {
+		return ""
+	}
+	var v string
+	_ = json.Unmarshal(m[key], &v)
+	return v
+}
+
+// followup hands an existing Codex sub-agent new work (collaborationfollowup_task). The agent will run again
+// under the same agent_id without a SubagentStart, so the work is declared as a new delegation — a new
+// episode, a new child run — bound to the agent whose spawn delegation carries the target's task key. A
+// sealed child run is never reopened. When the target cannot be tied to exactly one bound agent, the call is
+// an ordinary tool_call; the agent's later events are then kept in the delegating chain with a signed
+// capture-fidelity checkpoint (continuation).
+func (r *recorder) followup(ctx context.Context, run *state.Run, in input, ext map[string]any) (bool, error) {
+	key := taskKey(stringField(in.ToolInput, "target"))
+	agent, matches := "", 0
+	if key != "" {
+		for _, sr := range r.sessionRuns(run) {
+			for _, d := range sr.Delegations {
+				if d.TaskKey == key && d.ClaudeAgentID != "" && d.FollowupOf == "" && d.ClaudeAgentID != agent {
+					agent = d.ClaudeAgentID
+					matches++
+				}
+			}
+		}
+	}
+	if matches != 1 {
+		logf(r.store, "run %s: follow-up %s not tied to one sub-agent (%d candidates); recorded as a tool call", run.Name, in.ToolUseID, matches)
+		return false, nil
+	}
+	d := state.Delegation{
+		ChildCorrelationID: "urn:uuid:" + evidence.NewUUID(),
+		ChildAgentID:       r.cfg.AgentID + ":" + safeName(host.SubagentTypeOf("")),
+		SubagentType:       host.SubagentTypeOf(""),
+		UseID:              in.ToolUseID,
+		Seq:                run.NextSeq,
+		ResultSeq:          -1,
+		CreatedAt:          time.Now(),
+		TaskKey:            key,
+		FollowupOf:         agent,
+		ClaudeAgentID:      agent,
+	}
+	return true, r.delegateWith(ctx, run, in, ext, d)
+}
+
+// startEpisode opens the child run for the next episode of a Codex sub-agent: the one committed, unresolved
+// follow-up delegation for this agent without a run yet. nil when there is none.
+func (r *recorder) startEpisode(ctx context.Context, main *state.Run, in input) (*state.Run, error) {
+	var parent *state.Run
+	idx, n := -1, 0
+	for _, sr := range r.sessionRuns(main) {
+		if sr.Closed || sr.Broken != "" || sr.CloseRequested != "" {
+			continue
+		}
+		for i, d := range sr.Delegations {
+			if d.FollowupOf == in.AgentID && d.Committed(sr) && d.ChildRun == "" && !d.Resolved(sr) {
+				parent, idx = sr, i
+				n++
+			}
+		}
+	}
+	if n != 1 {
+		return nil, nil
+	}
+	d := &parent.Delegations[idx]
+	d.ChildRun = time.Now().UTC().Format("20060102T150405Z") + "-" + evidence.NewUUID()[:8]
+	if err := r.store.Save(parent); err != nil {
+		return nil, err
+	}
+	child, err := r.newRun(ctx, in, "", parent, d)
+	if err != nil {
+		if child != nil {
+			logf(r.store, "run %s: sub-agent episode run %s could not start: %v", parent.Name, child.Name, err)
+		}
+		return nil, err
+	}
+	return child, nil
+}
+
+// continuation records, once per run, that a sub-agent acted after its run had closed with no follow-up to
+// tie the new work to (an unresolvable follow-up, or a stop hook that asked it to continue). Its events are
+// kept in this chain, tagged; the signed checkpoint makes the gap visible and the run closes aborted.
+func (r *recorder) continuation(ctx context.Context, run *state.Run, agentID string) error {
+	if run.FidelityIssue != "" {
+		return nil
+	}
+	detail := "capture-fidelity: a sub-agent acted after its run had closed without a recorded follow-up; its later events are recorded in this run"
+	run.FidelityIssue = detail
+	if run.NextSeq+1+run.Outstanding()+1 > maxEvents {
+		return r.breakRun(run, detail+"; it could not be recorded within the event budget, so capture stopped")
+	}
+	if err := r.store.Save(run); err != nil {
+		return err
+	}
+	logf(r.store, "run %s: sub-agent %s continued after its run closed", run.Name, agentID)
+	return r.seal(ctx, run, "checkpoint", map[string]any{"detail": detail}, false, false, nil, nil)
+}
+
+// delegateWith seals a prepared delegation.
+func (r *recorder) delegateWith(ctx context.Context, run *state.Run, in input, ext map[string]any, d state.Delegation) error {
 	block := map[string]any{"childCorrelationId": d.ChildCorrelationID, "childAgentId": d.ChildAgentID}
 	if d.UseID != "" {
 		block["useId"] = d.UseID
@@ -99,7 +218,7 @@ func (r *recorder) startChild(ctx context.Context, main *state.Run, in input) er
 			continue
 		}
 		for i, d := range run.Delegations {
-			if d.Committed(run) && d.ChildRun == "" && !d.Resolved(run) && d.SubagentType == host.SubagentTypeOf(in.AgentType) {
+			if d.Committed(run) && d.ChildRun == "" && !d.Resolved(run) && d.FollowupOf == "" && d.SubagentType == host.SubagentTypeOf(in.AgentType) {
 				candidates++
 				parent, idx = run, i
 			}
@@ -144,8 +263,10 @@ func (r *recorder) sessionRuns(main *state.Run) []*state.Run {
 	return runs
 }
 
-// childByAgent finds the run recording a Claude Code sub-agent, by its agent_id.
+// childByAgent finds the run recording a sub-agent, by its agent_id: its open episode when it has one,
+// otherwise its latest (Codex agents can run several episodes, each its own child run).
 func (r *recorder) childByAgent(session, agentID string) (*state.Run, error) {
+	var latest *state.Run
 	for _, name := range r.store.Runs(session) {
 		run, err := r.store.LoadRun(session, name)
 		if err != nil || run.ClaudeAgentID != agentID || run.ParentRun == "" {
@@ -154,9 +275,17 @@ func (r *recorder) childByAgent(session, agentID string) (*state.Run, error) {
 		if run.Account != "" && run.Account != r.account {
 			return nil, nil
 		}
-		return run, r.recover(run)
+		if err := r.recover(run); err != nil {
+			return run, err
+		}
+		if !run.Closed && run.Broken == "" {
+			return run, nil
+		}
+		if latest == nil || run.StartedAt.After(latest.StartedAt) {
+			latest = run
+		}
 	}
-	return nil, nil
+	return latest, nil
 }
 
 // closeChild ends a sub-agent run and records the result in its parent, with the same closure protocol as

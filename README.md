@@ -113,6 +113,16 @@ Developers connect once with `SIGILL_HOST=codex /opt/sigill/sigill-hook connect`
 `sigill-connect` skill, if you also install the plugin for its skills). Settings such as
 `SIGILL_CERTIFICATE_ID` or `SIGILL_QUALIFIED=1` go in front of the command in the same way.
 
+What Codex shows the recorder, and so what it can capture: the tools that trigger hooks (`Bash`,
+`apply_patch`, MCP tools and the collaboration tools); hosted tools such as web search do not, and
+input written to a running command (`write_stdin`) is not a new tool call, so neither is recorded
+or blocked — `SIGILL_FAIL_CLOSED=1` applies to hook-visible tools only. A sub-agent handed new work
+(`followup_task`) is recorded as a new episode: its own child run, bound to a new delegation. When
+the recorder cannot tie such work to a delegation, it keeps the work in the session's run behind a
+signed capture-fidelity checkpoint and closes that run `aborted` — never silently dropped. Several
+sub-agents started at once are bound only when the pairing is unambiguous (Codex reports every
+sub-agent as type `default`); otherwise their work is kept in the session's run, tagged.
+
 The same recorder runs in both hosts (`SIGILL_HOST=codex` in the Codex hooks), with its own
 connection, data directory (`~/.codex/plugins/data/sigill-sigill`) and agent id
 (`urn:sigill:agent:codex`). Sub-agents started with Codex's `spawn_agent` are recorded as

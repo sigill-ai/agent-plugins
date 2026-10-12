@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/sigill-ai/agent-plugins/internal/sigill"
 )
 
 // hostProfile is what differs between the agent hosts the recorder runs in. The hook protocol is the same
@@ -42,6 +44,8 @@ type hostProfile struct {
 	SubagentType func(toolInput json.RawMessage) string
 	// SubagentTypeOf is the role a SubagentStart reports, compared with SubagentType for pairing.
 	SubagentTypeOf func(agentType string) string
+	// IsFollowupTool reports the tool that hands an existing sub-agent new work (no SubagentStart follows).
+	IsFollowupTool func(tool string) bool
 }
 
 var claudeCodeHost = hostProfile{
@@ -71,6 +75,7 @@ var claudeCodeHost = hostProfile{
 		return in.SubagentType
 	},
 	SubagentTypeOf: func(t string) string { return t },
+	IsFollowupTool: func(string) bool { return false },
 }
 
 // Codex (OpenAI). Hook fields observed on codex-cli 0.153: spawning a sub-agent is the tool
@@ -88,9 +93,9 @@ var codexHost = hostProfile{
 	DefaultAgentID: "urn:sigill:agent:codex",
 	ClientID:       "https://sigill.ai/.well-known/oauth-client/codex.json",
 	ConnectCommand: "the sigill-connect skill",
-	// Codex gives a plugin <data root>/<plugin>-<marketplace>; the hooks file passes it explicitly, this is
-	// the same place for commands run by hand.
-	DefaultDataDir:   func(home string) string { return filepath.Join(home, ".codex", "plugins", "data", "sigill-sigill") },
+	// Hooks receive the plugin data directory from Codex (PLUGIN_DATA); commands run from a skill derive the
+	// same directory from where this binary is installed (codexDataDir).
+	DefaultDataDir:   func(home string) string { return codexDataDir(os.Getenv("CODEX_HOME"), home, executablePath()) },
 	InstructionFiles: []string{"AGENTS.md", ".codex/AGENTS.md"}, InstructionDefault: "AGENTS.md",
 	SettingsFiles: []string{".codex/config.toml", ".codex/hooks.json"}, SettingsDefault: ".codex/config.toml",
 	AgentDefinition: func(string) string { return "" }, // sub-agents share the session's instructions
@@ -115,6 +120,12 @@ var codexHost = hostProfile{
 		}
 		return t
 	},
+	// collaborationfollowup_task {message, target}: target is the task_name the agent was spawned under
+	// (observed on codex-cli 0.153). The agent runs again with the same agent_id, without SubagentStart, and
+	// ends that episode with another SubagentStop.
+	IsFollowupTool: func(t string) bool {
+		return t == "collaborationfollowup_task" || t == "followup_task" || t == "collaboration.followup_task"
+	},
 }
 
 // host is the profile of this invocation (SIGILL_HOST; the finalizer inherits the environment).
@@ -127,51 +138,107 @@ func hostFromEnv() hostProfile {
 	return claudeCodeHost
 }
 
-// hooksMarker records the last SessionStart the host delivered to us. It is the one reliable signal that
-// the host really runs the recorder's hooks: Codex skips plugin hooks until the user has reviewed them
-// (/hooks), again after each plugin update, and says nothing about it.
-const hooksMarker = "hooks-last-session-start"
+// Status markers. Neither proves the hooks run now: Codex skips plugin hooks until they are reviewed (and
+// again after each update), and a plugin cannot read Codex's trust state. They record what this installation
+// last observed — a hook delivery (with the recorder version that received it) and a committed step — so
+// status can say what is known and what is not.
+const (
+	hooksMarker    = "hooks-last-delivery"
+	recordedMarker = "last-recorded-step"
+)
 
-func markHooksActive(dataDir string) {
+func writeMarker(dataDir, name, value string) {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return
 	}
-	_ = os.WriteFile(filepath.Join(dataDir, hooksMarker), []byte(time.Now().UTC().Format(time.RFC3339)), 0o600)
+	_ = os.WriteFile(filepath.Join(dataDir, name), []byte(value), 0o600)
+}
+
+func readMarker(dataDir, name string) string {
+	b, err := os.ReadFile(filepath.Join(dataDir, name))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// markHooksActive records a SessionStart delivery and the recorder version that received it.
+func markHooksActive(dataDir string) {
+	writeMarker(dataDir, hooksMarker, time.Now().UTC().Format(time.RFC3339)+" "+sigill.Version)
+}
+
+func markRecorded(dataDir string) {
+	writeMarker(dataDir, recordedMarker, time.Now().UTC().Format(time.RFC3339))
 }
 
 // codexEvents are the events hooks/codex-hooks.json registers, as Codex names them in its review state.
 var codexEvents = []string{"session_start", "user_prompt_submit", "pre_tool_use", "post_tool_use",
 	"subagent_start", "subagent_stop", "stop", "session_end"}
 
-// codexHooksStatus explains whether Codex runs the Sigill hooks. Reviewed hooks are listed in Codex's
-// config as hooks.state."sigill@sigill:hooks/codex-hooks.json:<event>:…"; managed hooks (requirements.toml)
-// need no review and do not appear there, so the session-start marker is the deciding signal.
+// codexHooksStatus reports, separately, the last hook delivery observed (and by which version), how many
+// Sigill hook entries Codex's config lists (presence only — a plugin cannot verify Codex's trust hash, and
+// managed hooks do not appear there), and the last step sealed. It never claims the hooks are active now.
 func codexHooksStatus(dataDir string) string {
-	last := ""
-	if b, err := os.ReadFile(filepath.Join(dataDir, hooksMarker)); err == nil {
-		last = strings.TrimSpace(string(b))
-	}
 	home := os.Getenv("CODEX_HOME")
 	if home == "" {
 		h, _ := os.UserHomeDir()
 		home = filepath.Join(h, ".codex")
 	}
-	reviewed := 0
+	listed := 0
 	if cfg, err := os.ReadFile(filepath.Join(home, "config.toml")); err == nil {
 		for _, ev := range codexEvents {
 			if strings.Contains(string(cfg), `hooks.state."sigill@sigill:hooks/codex-hooks.json:`+ev+`:`) {
-				reviewed++
+				listed++
 			}
 		}
 	}
-	const fix = "start codex, run /hooks and press t to trust the Sigill hooks (needed again after each plugin update)"
+	const fix = "start codex, run /hooks and trust the Sigill hooks (press t); this is needed again after each plugin update, or use managed hooks"
+	var b strings.Builder
+	delivery := readMarker(dataDir, hooksMarker)
+	when, version, _ := strings.Cut(delivery, " ")
 	switch {
-	case last != "":
-		return fmt.Sprintf("hooks: active — last session start recorded %s (%d of %d reviewed in your Codex config). If a session started after that was not recorded, %s.",
-			last, reviewed, len(codexEvents), fix)
-	case reviewed < len(codexEvents):
-		return fmt.Sprintf("hooks: NOT RUNNING — Codex skips plugin hooks until they are reviewed (%d of %d reviewed): %s.", reviewed, len(codexEvents), fix)
+	case delivery == "":
+		fmt.Fprintf(&b, "hooks: no hook delivery observed yet — %s.\n", fix)
+	case version != sigill.Version:
+		fmt.Fprintf(&b, "hooks: last delivery observed %s by version %s, not by this version (%s) — after an update %s.\n", when, version, sigill.Version, fix)
 	default:
-		return "hooks: reviewed, but no session has started since — start a new Codex session."
+		fmt.Fprintf(&b, "hooks: last delivery observed %s by this version; whether Codex runs them now is not verifiable from here — if a newer session was not recorded, %s.\n", when, fix)
 	}
+	fmt.Fprintf(&b, "hooks in Codex config: %d of %d Sigill entries listed (presence only; managed hooks are not listed)\n", listed, len(codexEvents))
+	if rec := readMarker(dataDir, recordedMarker); rec != "" {
+		fmt.Fprintf(&b, "recording: last step sealed %s", rec)
+	} else {
+		b.WriteString("recording: no step sealed yet")
+	}
+	return b.String()
+}
+
+func executablePath() string {
+	p, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return p
+}
+
+// codexDataDir is the data directory Codex gives this plugin installation: an installed plugin runs from
+// <codex home>/plugins/cache/<marketplace>/<plugin>/<version>/libexec/, and Codex's data directory for it is
+// <codex home>/plugins/data/<plugin>-<marketplace>. A binary elsewhere (a local checkout, a managed
+// /opt install) uses $CODEX_HOME (default ~/.codex) with the Sigill marketplace's names.
+func codexDataDir(codexHome, userHome, exe string) string {
+	dir := filepath.Dir(exe)    // …/libexec
+	ver := filepath.Dir(dir)    // …/<version>
+	plugin := filepath.Dir(ver) // …/<plugin>
+	mkt := filepath.Dir(plugin) // …/<marketplace>
+	cache := filepath.Dir(mkt)  // …/cache
+	if exe != "" && filepath.Base(dir) == "libexec" && filepath.Base(cache) == "cache" && filepath.Base(filepath.Dir(cache)) == "plugins" {
+		return filepath.Join(filepath.Dir(cache), "data", filepath.Base(plugin)+"-"+filepath.Base(mkt))
+	}
+	if codexHome == "" {
+		codexHome = filepath.Join(userHome, ".codex")
+	}
+	return filepath.Join(codexHome, "plugins", "data", "sigill-sigill")
 }

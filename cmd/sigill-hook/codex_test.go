@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -127,8 +128,14 @@ func TestCodex_HostProfile(t *testing.T) {
 func TestCodex_HooksStatus(t *testing.T) {
 	data, home := t.TempDir(), t.TempDir()
 	t.Setenv("CODEX_HOME", home)
-	if got := codexHooksStatus(data); !strings.Contains(got, "NOT RUNNING") || !strings.Contains(got, "0 of 8") {
-		t.Fatalf("no review, no marker: %s", got)
+	if got := codexHooksStatus(data); !strings.Contains(got, "no hook delivery observed") || !strings.Contains(got, "0 of 8") || !strings.Contains(got, "no step sealed") {
+		t.Fatalf("nothing observed: %s", got)
+	}
+	// A delivery by an older version (the trust of the updated hooks is unknown) and a stale marker never
+	// read as "active" (Codex R8-2).
+	writeMarker(data, hooksMarker, "2020-01-01T00:00:00Z 0.0.1")
+	if got := codexHooksStatus(data); strings.Contains(got, "active") || !strings.Contains(got, "not by this version") {
+		t.Fatalf("older delivery: %s", got)
 	}
 	cfg := ""
 	for _, ev := range codexEvents {
@@ -137,11 +144,174 @@ func TestCodex_HooksStatus(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got := codexHooksStatus(data); !strings.Contains(got, "no session has started") {
-		t.Fatalf("reviewed, no marker: %s", got)
-	}
 	markHooksActive(data)
-	if got := codexHooksStatus(data); !strings.Contains(got, "active") || !strings.Contains(got, "8 of 8") {
-		t.Fatalf("marker present: %s", got)
+	markRecorded(data)
+	got := codexHooksStatus(data)
+	if strings.Contains(got, "active") || !strings.Contains(got, "by this version") || !strings.Contains(got, "8 of 8") ||
+		!strings.Contains(got, "presence only") || !strings.Contains(got, "last step sealed") {
+		t.Fatalf("current delivery: %s", got)
+	}
+}
+
+// Codex round 8 (R8-1): a sub-agent handed new work with collaborationfollowup_task runs again under the
+// same agent_id with no SubagentStart (probed on codex-cli 0.153: target = the spawn's task_name). Each
+// episode must be its own bound child run; a sealed run is never reopened, and nothing is dropped.
+func codexFollowupSession(sid, child, target string, followup bool) []input {
+	spawn := json.RawMessage(`{"task_name":"pwd-check","message":"secret task one"}`)
+	evs := []input{
+		{SessionID: sid, HookEventName: "SessionStart", Source: "startup"},
+		{SessionID: sid, HookEventName: "PreToolUse", ToolName: "collaborationspawn_agent", ToolUseID: "s1", ToolInput: spawn},
+		{SessionID: sid, HookEventName: "PostToolUse", ToolName: "collaborationspawn_agent", ToolUseID: "s1", ToolInput: spawn, ToolResponse: json.RawMessage(`"{\"task_name\":\"/root/pwd-check\"}"`)},
+		{SessionID: sid, HookEventName: "SubagentStart", AgentID: child, AgentType: "default"},
+		{SessionID: sid, HookEventName: "PreToolUse", ToolName: "Bash", ToolUseID: "b1", AgentID: child, AgentType: "default", ToolInput: json.RawMessage(`{"command":"pwd"}`)},
+		{SessionID: sid, HookEventName: "PostToolUse", ToolName: "Bash", ToolUseID: "b1", AgentID: child, AgentType: "default", ToolResponse: json.RawMessage(`"/x"`)},
+		{SessionID: sid, HookEventName: "SubagentStop", AgentID: child, AgentType: "default", LastAssistantMessage: "first answer"},
+	}
+	if followup {
+		f := json.RawMessage(`{"target":"` + target + `","message":"secret task two"}`)
+		evs = append(evs,
+			input{SessionID: sid, HookEventName: "PreToolUse", ToolName: "collaborationfollowup_task", ToolUseID: "f1", ToolInput: f},
+			input{SessionID: sid, HookEventName: "PostToolUse", ToolName: "collaborationfollowup_task", ToolUseID: "f1", ToolInput: f, ToolResponse: json.RawMessage(`"ok"`)})
+	}
+	return append(evs,
+		input{SessionID: sid, HookEventName: "PreToolUse", ToolName: "Bash", ToolUseID: "b2", AgentID: child, AgentType: "default", ToolInput: json.RawMessage(`{"command":"date"}`)},
+		input{SessionID: sid, HookEventName: "PostToolUse", ToolName: "Bash", ToolUseID: "b2", AgentID: child, AgentType: "default", ToolResponse: json.RawMessage(`"Mon"`)},
+		input{SessionID: sid, HookEventName: "SubagentStop", AgentID: child, AgentType: "default", LastAssistantMessage: "second answer"},
+		input{SessionID: sid, HookEventName: "Stop", LastAssistantMessage: "final"},
+		input{SessionID: sid, HookEventName: "SessionEnd", Reason: "other"})
+}
+
+func codexRec(t *testing.T) (*recorder, *fakeSigill) {
+	t.Helper()
+	asCodex(t)
+	fake := &fakeSigill{}
+	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
+	t.Cleanup(srv.Close)
+	return newRec(t, srv.URL, func(c *config) {
+		c.AgentID = codexHost.DefaultAgentID
+		c.Consequential = map[string]bool{"Bash": true}
+	}), fake
+}
+
+func TestCodex_R8_FollowupIsANewBoundEpisode(t *testing.T) {
+	rec, fake := codexRec(t)
+	sid, child := "019e0000-0000-7000-8000-0000000000f1", "01a13188-0000-7000-8000-000000000001"
+	for _, e := range codexFollowupSession(sid, child, "pwd-check", true) {
+		if e.ToolName == "Bash" && e.HookEventName == "PreToolUse" {
+			rec.toolCallCommitted = false
+			mustHook(t, rec, e)
+			if !rec.toolCallCommitted {
+				t.Fatalf("the sub-agent's consequential call %s was not committed (fail-closed would block it)", e.ToolUseID)
+			}
+			continue
+		}
+		mustHook(t, rec, e)
+	}
+	finalizeNow(t, rec, sid)
+
+	main, _ := rec.store.Current(sid)
+	want := "run_start,delegation,tool_result,delegation_result,delegation,tool_result,delegation_result,model_output,run_end"
+	if got := strings.Join(steps(t, rec, main), ","); got != want {
+		t.Fatalf("main run:\n got %s\nwant %s", got, want)
+	}
+	kids := childRuns(t, rec, sid)
+	if len(kids) != 2 {
+		t.Fatalf("got %d episode runs, want 2", len(kids))
+	}
+	sort.Slice(kids, func(i, j int) bool { return kids[i].StartedAt.Before(kids[j].StartedAt) })
+	_, mainArts := events(t, rec, main)
+	for i, k := range kids {
+		if got := strings.Join(steps(t, rec, k), ","); got != "run_start,tool_call,tool_result,model_output,run_end" {
+			t.Fatalf("episode %d: %s", i+1, got)
+		}
+		_, arts := events(t, rec, k)
+		start, end := decode(t, arts[0]), decode(t, arts[len(arts)-1])
+		if end.Step["runDisposition"] != "completed" {
+			t.Fatalf("episode %d closes %v", i+1, end.Step["runDisposition"])
+		}
+		del := decode(t, mainArts[[]int{1, 4}[i]]).Step["delegation"].(map[string]any)
+		if del["childCorrelationId"] != k.CorrelationID ||
+			start.Binds["parentDelegationSignatureSha256"] != evidence.SignatureSha256(mainArts[[]int{1, 4}[i]].Signature) {
+			t.Fatalf("episode %d is not bound to its delegation", i+1)
+		}
+		res := decode(t, mainArts[[]int{3, 6}[i]]).Step["delegation"].(map[string]any)
+		if res["childRunEndSignatureSha256"] != evidence.SignatureSha256(arts[len(arts)-1].Signature) {
+			t.Fatalf("episode %d result not bound", i+1)
+		}
+	}
+	if decode(t, mainArts[len(mainArts)-1]).Step["runDisposition"] != "completed" {
+		t.Fatal("main closes completed")
+	}
+	for _, req := range fake.requests {
+		b, _ := json.Marshal(req)
+		for _, secret := range []string{"secret task", "pwd-check", "first answer", "second answer"} {
+			if strings.Contains(string(b), secret) {
+				t.Fatalf("content %q leaked to the sealing service", secret)
+			}
+		}
+	}
+}
+
+// An unresolvable follow-up, or a sub-agent that continues after SubagentStop without one: its later work is
+// kept in the delegating chain, tagged, behind a signed capture-fidelity checkpoint; the run closes aborted.
+func TestCodex_R8_UntrackedContinuationIsKeptAndDisclosed(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		followup bool
+		target   string
+	}{{"unknown follow-up target", true, "someone-else"}, {"continues after SubagentStop", false, ""}} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec, _ := codexRec(t)
+			sid, child := "019e0000-0000-7000-8000-0000000000f2", "01a13188-0000-7000-8000-000000000002"
+			for _, e := range codexFollowupSession(sid, child, tc.target, tc.followup) {
+				if e.ToolName == "Bash" && e.ToolUseID == "b2" && e.HookEventName == "PreToolUse" {
+					rec.toolCallCommitted = false
+					mustHook(t, rec, e)
+					if !rec.toolCallCommitted {
+						t.Fatal("work after the run closed was not recorded (fail-closed would block it)")
+					}
+					continue
+				}
+				mustHook(t, rec, e)
+			}
+			finalizeNow(t, rec, sid)
+			main, _ := rec.store.Current(sid)
+			got := strings.Join(steps(t, rec, main), ",")
+			if !strings.Contains(got, "checkpoint,tool_call,tool_result,model_output") {
+				t.Fatalf("main run must keep the continuation behind a checkpoint: %s", got)
+			}
+			_, arts := events(t, rec, main)
+			end := decode(t, arts[len(arts)-1])
+			if end.Step["runDisposition"] != "aborted" || !strings.Contains(end.Step["detail"].(string), "capture-fidelity") {
+				t.Fatalf("main must close aborted with the fidelity detail: %v", end.Step)
+			}
+			if kids := childRuns(t, rec, sid); len(kids) != 1 {
+				t.Fatalf("no new episode without a bound follow-up: got %d child runs", len(kids))
+			}
+		})
+	}
+}
+
+// Codex R8-3: commands run from a skill must use the data directory of the installation they belong to.
+func TestCodex_R8_DataDirFollowsTheInstallation(t *testing.T) {
+	for _, tc := range []struct{ name, codexHome, exe, want string }{
+		{"installed, default home", "", "/Users/u/.codex/plugins/cache/sigill/sigill/0.3.1/libexec/sigill-hook-darwin-arm64",
+			"/Users/u/.codex/plugins/data/sigill-sigill"},
+		{"older cached version selected", "", "/Users/u/.codex/plugins/cache/sigill/sigill/0.2.9/libexec/sigill-hook-darwin-arm64",
+			"/Users/u/.codex/plugins/data/sigill-sigill"},
+		{"custom CODEX_HOME with spaces and another marketplace name", "/ignored",
+			"/Volumes/My Disk/codex home/plugins/cache/acme-tools/sigill/0.3.1/libexec/sigill-hook-linux-amd64",
+			"/Volumes/My Disk/codex home/plugins/data/sigill-acme-tools"},
+		{"local checkout uses CODEX_HOME", "/srv/codex", "/home/u/src/agent-plugins/plugins/sigill-evidence/libexec/sigill-hook-linux-amd64",
+			"/srv/codex/plugins/data/sigill-sigill"},
+		{"managed install, default home", "", "/opt/sigill/sigill-hook-linux-amd64", "/home/u/.codex/plugins/data/sigill-sigill"},
+	} {
+		home := "/Users/u"
+		if strings.HasPrefix(tc.exe, "/home/") || strings.HasPrefix(tc.exe, "/opt/") {
+			home = "/home/u"
+		}
+		if got := codexDataDir(tc.codexHome, home, tc.exe); got != tc.want {
+			t.Errorf("%s: got %s want %s", tc.name, got, tc.want)
+		}
 	}
 }

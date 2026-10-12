@@ -97,6 +97,10 @@ type Delegation struct {
 	ClaudeAgentID      string    `json:"claudeAgentId,omitempty"`
 	ResultSeq          int       `json:"resultSeq"` // the delegation_result event; -1 none
 	CreatedAt          time.Time `json:"createdAt"`
+	// Codex: TaskKey is a one-way key of the task_name the sub-agent was spawned (or followed up) under;
+	// FollowupOf is the host agent a follow-up delegation hands new work to — its next episode.
+	TaskKey    string `json:"taskKey,omitempty"`
+	FollowupOf string `json:"followupOf,omitempty"`
 }
 
 // Committed: the delegation event is part of the chain.

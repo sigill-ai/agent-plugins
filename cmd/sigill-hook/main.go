@@ -328,9 +328,24 @@ func (r *recorder) handle(ctx context.Context, in input) (*state.Run, error) {
 			return run, err
 		}
 		switch {
-		case child != nil && (child.Closed || child.Broken != ""):
-			logf(r.store, "run %s: sub-agent event %s after its run ended, not recorded", child.Name, in.HookEventName)
+		case child != nil && child.Broken != "":
+			logf(r.store, "run %s: sub-agent event %s after its run stopped, not recorded", child.Name, in.HookEventName)
 			return run, nil
+		case child != nil && child.Closed:
+			// The agent works again after its run closed (a Codex follow-up). Its next episode opens the run
+			// its follow-up delegation declared; without one the work is kept here, never dropped.
+			ep, err := r.startEpisode(ctx, run, in)
+			if err != nil {
+				return run, err
+			}
+			if ep != nil {
+				target = ep
+				break
+			}
+			if err := r.continuation(ctx, run, in.AgentID); err != nil {
+				return run, err
+			}
+			ext[host.ExtKey] = map[string]any{"agentId": in.AgentID, "agentType": in.AgentType, "continuation": true}
 		case child != nil:
 			target = child
 		default:
@@ -349,7 +364,13 @@ func (r *recorder) handle(ctx context.Context, in input) (*state.Run, error) {
 	case "PreToolUse":
 		// toolCallCommitted is set by seal() only when THIS invocation durably commits the tool_call (or the
 		// delegation for an Agent call): a nil error alone never authorizes a consequential tool.
-		if isAgentTool(in.ToolName) && target.Version() == "2" && hasRoomToDelegate(target) {
+		followedUp := false
+		if host.IsFollowupTool(in.ToolName) && target.Version() == "2" && hasRoomToDelegate(target) {
+			followedUp, err = r.followup(ctx, target, in, ext)
+		}
+		if followedUp || err != nil {
+			// declared as a new episode (or failed trying): nothing more to record for this call
+		} else if isAgentTool(in.ToolName) && target.Version() == "2" && hasRoomToDelegate(target) {
 			err = r.delegate(ctx, target, in, ext)
 		} else {
 			conseq := r.cfg.isConsequential(in.ToolName)
@@ -652,7 +673,11 @@ func (r *recorder) advance(run *state.Run, p state.Pending, sig string) error {
 		run.Closed = true
 	}
 	run.Pending = nil
-	return r.store.Save(run)
+	if err := r.store.Save(run); err != nil {
+		return err
+	}
+	markRecorded(r.cfg.DataDir) // for status: a step was durably sealed and committed
+	return nil
 }
 
 // recover completes or stops an interrupted commit (see commitSealed).
