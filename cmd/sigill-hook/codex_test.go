@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/sigill-ai/agent-plugins/internal/evidence"
 )
@@ -313,5 +315,86 @@ func TestCodex_R8_DataDirFollowsTheInstallation(t *testing.T) {
 		if got := codexDataDir(tc.codexHome, home, tc.exe); got != tc.want {
 			t.Errorf("%s: got %s want %s", tc.name, got, tc.want)
 		}
+	}
+}
+
+// Codex R9-1: a follow-up delivered into a running episode (or while an earlier follow-up is pending) is
+// steering, not a new episode; repeated idle follow-ups each get their own episode.
+func TestCodex_R9_FollowupWhileRunningStaysInTheOpenEpisode(t *testing.T) {
+	rec, _ := codexRec(t)
+	sid, child := "019e0000-0000-7000-8000-0000000000f9", "01a13188-0000-7000-8000-000000000009"
+	skipped := false
+	for _, e := range codexFollowupSession(sid, child, "pwd-check", true) {
+		if e.HookEventName == "SubagentStop" && !skipped { // the agent is still running when the follow-up arrives
+			skipped = true
+			continue
+		}
+		mustHook(t, rec, e)
+	}
+	finalizeNow(t, rec, sid)
+	main, _ := rec.store.Current(sid)
+	_, arts := events(t, rec, main)
+	if main.Outstanding() != 0 || decode(t, arts[len(arts)-1]).Step["runDisposition"] != "completed" {
+		t.Fatalf("phantom episode: outstanding=%d steps=%s", main.Outstanding(), strings.Join(steps(t, rec, main), ","))
+	}
+	if kids := childRuns(t, rec, sid); len(kids) != 1 {
+		t.Fatalf("got %d child runs, want the one open episode", len(kids))
+	}
+}
+
+func TestCodex_R9_RepeatedIdleFollowupsAreEpisodes(t *testing.T) {
+	rec, _ := codexRec(t)
+	sid, child := "019e0000-0000-7000-8000-0000000000fa", "01a13188-0000-7000-8000-00000000000a"
+	evs := codexFollowupSession(sid, child, "pwd-check", true)
+	tail := evs[len(evs)-2:] // Stop, SessionEnd
+	evs = evs[:len(evs)-2]
+	f := json.RawMessage(`{"target":"pwd-check","message":"third"}`)
+	evs = append(evs,
+		input{SessionID: sid, HookEventName: "PreToolUse", ToolName: "collaborationfollowup_task", ToolUseID: "f2", ToolInput: f},
+		input{SessionID: sid, HookEventName: "PreToolUse", ToolName: "collaborationfollowup_task", ToolUseID: "f3", ToolInput: f}, // pending: steering
+		input{SessionID: sid, HookEventName: "PreToolUse", ToolName: "Bash", ToolUseID: "b3", AgentID: child, AgentType: "default", ToolInput: json.RawMessage(`{"command":"ls"}`)},
+		input{SessionID: sid, HookEventName: "SubagentStop", AgentID: child, AgentType: "default", LastAssistantMessage: "third answer"})
+	for _, e := range append(evs, tail...) {
+		mustHook(t, rec, e)
+	}
+	finalizeNow(t, rec, sid)
+	main, _ := rec.store.Current(sid)
+	_, arts := events(t, rec, main)
+	if n := len(childRuns(t, rec, sid)); n != 3 || main.Outstanding() != 0 || decode(t, arts[len(arts)-1]).Step["runDisposition"] != "completed" {
+		t.Fatalf("want 3 bound episodes, completed: episodes=%d outstanding=%d steps=%s", n, main.Outstanding(), strings.Join(steps(t, rec, main), ","))
+	}
+}
+
+// Codex R9-2: status markers never block or follow links; a failed write does not matter.
+func TestCodex_R9_MarkersNeverBlockOrFollowLinks(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{recordedMarker, hooksMarker} {
+		_ = os.Remove(filepath.Join(dir, name))
+		if err := syscall.Mkfifo(filepath.Join(dir, name), 0o600); err != nil {
+			t.Skipf("mkfifo: %v", err)
+		}
+		done := make(chan struct{})
+		go func() { _ = readMarker(dir, name); markRecorded(dir); markHooksActive(dir); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s: marker I/O blocked on a FIFO", name)
+		}
+	}
+	victim := filepath.Join(dir, "victim")
+	_ = os.WriteFile(victim, []byte("keep"), 0o600)
+	_ = os.Remove(filepath.Join(dir, recordedMarker))
+	if err := os.Symlink(victim, filepath.Join(dir, recordedMarker)); err != nil {
+		t.Fatal(err)
+	}
+	if readMarker(dir, recordedMarker) != "" {
+		t.Fatal("a symlinked marker must not be read")
+	}
+	markRecorded(dir)
+	if b, _ := os.ReadFile(victim); string(b) != "keep" {
+		t.Fatal("writing the marker followed a symlink")
+	}
+	if readMarker(dir, recordedMarker) == "" {
+		t.Fatal("the marker was not replaced")
 	}
 }

@@ -111,6 +111,23 @@ func (r *recorder) followup(ctx context.Context, run *state.Run, in input, ext m
 		logf(r.store, "run %s: follow-up %s not tied to one sub-agent (%d candidates); recorded as a tool call", run.Name, in.ToolUseID, matches)
 		return false, nil
 	}
+	// A new episode only when the agent's previous one has ended and none is already declared: a follow-up
+	// delivered into a running turn (Codex supports that) is steering of the open episode, recorded as a tool
+	// call; declaring a child for a turn that never starts would leave the parent with a phantom delegation.
+	if open, err := r.childByAgent(run.SessionID, agent); err != nil {
+		return false, err
+	} else if open != nil && !open.Closed && open.Broken == "" {
+		logf(r.store, "run %s: follow-up %s delivered to a running sub-agent; recorded as a tool call", run.Name, in.ToolUseID)
+		return false, nil
+	}
+	for _, sr := range r.sessionRuns(run) {
+		for _, d := range sr.Delegations {
+			if d.FollowupOf == agent && d.ChildRun == "" && !d.Resolved(sr) {
+				logf(r.store, "run %s: follow-up %s while an earlier follow-up is pending; recorded as a tool call", run.Name, in.ToolUseID)
+				return false, nil
+			}
+		}
+	}
 	d := state.Delegation{
 		ChildCorrelationID: "urn:uuid:" + evidence.NewUUID(),
 		ChildAgentID:       r.cfg.AgentID + ":" + safeName(host.SubagentTypeOf("")),

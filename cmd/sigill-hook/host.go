@@ -3,9 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/sigill-ai/agent-plugins/internal/sigill"
@@ -147,19 +149,43 @@ const (
 	recordedMarker = "last-recorded-step"
 )
 
+// writeMarker replaces a status marker atomically and best-effort: a fresh private temp file (O_EXCL) is
+// renamed over the name, so an existing FIFO, symlink or other file at that name is replaced, never opened or
+// followed. Failures are ignored — the marker is diagnostic and must never stall or fail a committed seal.
 func writeMarker(dataDir, name, value string) {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return
 	}
-	_ = os.WriteFile(filepath.Join(dataDir, name), []byte(value), 0o600)
+	tmp, err := os.CreateTemp(dataDir, "."+name+".tmp-*")
+	if err != nil {
+		return
+	}
+	_, werr := tmp.WriteString(value)
+	if cerr := tmp.Close(); werr != nil || cerr != nil {
+		os.Remove(tmp.Name())
+		return
+	}
+	if os.Rename(tmp.Name(), filepath.Join(dataDir, name)) != nil {
+		os.Remove(tmp.Name())
+	}
 }
 
+// readMarker reads a small private regular file without blocking or following links; anything else is "".
 func readMarker(dataDir, name string) string {
-	b, err := os.ReadFile(filepath.Join(dataDir, name))
+	fh, err := os.OpenFile(filepath.Join(dataDir, name), os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(b))
+	defer fh.Close()
+	fi, err := fh.Stat()
+	if err != nil || !fi.Mode().IsRegular() || fi.Size() > 256 {
+		return ""
+	}
+	buf := make([]byte, fi.Size())
+	if _, err := io.ReadFull(fh, buf); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(buf))
 }
 
 // markHooksActive records a SessionStart delivery and the recorder version that received it.
