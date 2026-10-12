@@ -16,12 +16,12 @@ import (
 // expire makes the stored access token due for refresh.
 func expire(t *testing.T, m *Manager) {
 	t.Helper()
-	c, err := m.load()
+	c, err := m.load(context.Background())
 	if err != nil || c == nil {
 		t.Fatal("no credential")
 	}
 	c.AccessExpiry = time.Now().Add(-time.Minute)
-	if err := m.save(c); err != nil {
+	if err := m.save(context.Background(), c); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -44,7 +44,7 @@ func TestRefresh_DeathAfterRotation_NeverReplays(t *testing.T) {
 	if n := f.refreshCalls.Load(); n != 0 || f.isRevoked() {
 		t.Fatalf("the old refresh token was replayed (%d calls, revoked %v)", n, f.isRevoked())
 	}
-	if c, _ := m.load(); c == nil || c.Uncertain == "" {
+	if c, _ := m.load(context.Background()); c == nil || c.Uncertain == "" {
 		t.Fatal("the credential must be marked uncertain")
 	}
 }
@@ -281,7 +281,7 @@ func TestRefresh_NotSentWhenTheMarkerCannotBeMadeDurable(t *testing.T) {
 	m := &Manager{Dir: dir, Store: &FileStore{Path: filepath.Join(dir, "credential.json")}, HTTP: srv.Client()}
 	cred := &Credential{Issuer: srv.URL, TokenURL: srv.URL + "/token", ClientID: "c", RefreshToken: "R0", AccessToken: "a",
 		AccessExpiry: time.Now().Add(-time.Minute)}
-	if err := m.save(cred); err != nil {
+	if err := m.save(context.Background(), cred); err != nil {
 		t.Fatal(err)
 	}
 	// The marker's place is taken by a directory: it cannot be written.

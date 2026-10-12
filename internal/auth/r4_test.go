@@ -163,7 +163,7 @@ func TestManager_MigrationRacingAMarkerChange(t *testing.T) {
 		done <- writer.withLock(context.Background(), func() error {
 			close(inside)
 			<-release
-			return writer.save(&Credential{Issuer: "https://x", RefreshToken: "R-new", Uncertain: "test"})
+			return writer.save(context.Background(), &Credential{Issuer: "https://x", RefreshToken: "R-new", Uncertain: "test"})
 		})
 	}()
 	<-inside

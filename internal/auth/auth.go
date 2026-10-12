@@ -252,11 +252,11 @@ func (m *Manager) Connect(ctx context.Context, o ConnectOptions) (*Credential, e
 		return nil, errors.New("the connection was approved without agent recording; connect again and approve it")
 	}
 	err = m.withLock(ctx, func() error {
-		old, _ := m.load()
+		old, _ := m.load(ctx)
 		if old != nil && old.RefreshToken != "" && old.RevokeURL != "" {
 			m.revoke(ctx, old) // best effort: the replaced connection ends
 		}
-		if err := m.save(cred); err != nil {
+		if err := m.save(ctx, cred); err != nil {
 			return err
 		}
 		m.clearRefreshInFlight() // a new grant: an interrupted refresh of the old one no longer matters
@@ -359,7 +359,7 @@ func (c *Credential) apply(t *tokenResponse) error {
 // prompts; ErrNotConnected means the user must connect.
 func (m *Manager) AccessToken(ctx context.Context, issuer string) (string, *Credential, error) {
 	issuer = strings.TrimRight(issuer, "/")
-	cred, err := m.load()
+	cred, err := m.load(ctx)
 	if err != nil {
 		// An ambiguous or unavailable store is never guessed at: the user reconnects.
 		return "", nil, fmt.Errorf("%v — run /sigill:connect", err)
@@ -378,10 +378,10 @@ func (m *Manager) AccessToken(ctx context.Context, issuer string) (string, *Cred
 		return cred.AccessToken, cred, nil
 	}
 	err = m.withLock(ctx, func() error {
-		if err := m.migrate(); err != nil {
+		if err := m.migrate(ctx); err != nil {
 			return err
 		}
-		cur, err := m.load() // another hook may have refreshed meanwhile
+		cur, err := m.load(ctx) // another hook may have refreshed meanwhile
 		if err != nil || cur == nil {
 			return ErrNotConnected
 		}
@@ -389,7 +389,7 @@ func (m *Manager) AccessToken(ctx context.Context, issuer string) (string, *Cred
 		// Under the lock no other refresh is running: a marker left behind means one was interrupted.
 		if m.refreshInFlight() && cred.Uncertain == "" {
 			cred.Uncertain = "a token refresh was interrupted"
-			return m.save(cred)
+			return m.save(ctx, cred)
 		}
 		if time.Until(cred.AccessExpiry) > refreshMargin || cred.Uncertain != "" {
 			return nil
@@ -424,7 +424,7 @@ func (m *Manager) AccessToken(ctx context.Context, issuer string) (string, *Cred
 		default:
 			cred.Uncertain = "a token refresh got no answer"
 		}
-		if err := m.save(cred); err != nil {
+		if err := m.save(ctx, cred); err != nil {
 			return err // the marker stays: the next hook requires a reconnect instead of replaying
 		}
 		m.clearRefreshInFlight()
@@ -442,11 +442,11 @@ func (m *Manager) AccessToken(ctx context.Context, issuer string) (string, *Cred
 // Disconnect revokes the grant (best effort) and forgets the credential.
 func (m *Manager) Disconnect(ctx context.Context) error {
 	return m.withLock(ctx, func() error {
-		cred, _ := m.load()
+		cred, _ := m.load(ctx)
 		if cred != nil {
 			m.revoke(ctx, cred)
 		}
-		if err := m.Store.Delete(); err != nil {
+		if err := m.storeFor(ctx).Delete(); err != nil {
 			return err
 		}
 		m.clearRefreshInFlight()
@@ -455,7 +455,8 @@ func (m *Manager) Disconnect(ctx context.Context) error {
 }
 
 // Current returns the stored credential without refreshing (for status).
-func (m *Manager) Current() (*Credential, error) { return m.load() }
+// Bounded by helperTimeout per OS-helper call.
+func (m *Manager) Current() (*Credential, error) { return m.load(context.Background()) }
 
 func (m *Manager) revoke(ctx context.Context, c *Credential) {
 	if c.RevokeURL == "" || !sameOrigin(c.RevokeURL, c.Issuer) {
@@ -472,8 +473,17 @@ func (m *Manager) revoke(ctx context.Context, c *Credential) {
 	}
 }
 
-func (m *Manager) load() (*Credential, error) {
-	raw, err := m.Store.Get()
+// storeFor binds the credential store to the caller's context: every read, migration, write and cleanup
+// of one operation ends within the caller's deadline (Codex round 6).
+func (m *Manager) storeFor(ctx context.Context) SecretStore {
+	if b, ok := m.Store.(contextBinder); ok {
+		return b.withContext(ctx)
+	}
+	return m.Store
+}
+
+func (m *Manager) load(ctx context.Context) (*Credential, error) {
+	raw, err := m.storeFor(ctx).Get()
 	if err != nil || len(raw) == 0 {
 		return nil, err
 	}
@@ -485,8 +495,8 @@ func (m *Manager) load() (*Credential, error) {
 }
 
 // migrate adopts an unambiguous pre-marker store (see authority.Migrate). Only under the credential lock.
-func (m *Manager) migrate() error {
-	if mg, ok := m.Store.(interface{ Migrate() error }); ok {
+func (m *Manager) migrate(ctx context.Context) error {
+	if mg, ok := m.storeFor(ctx).(interface{ Migrate() error }); ok {
 		return mg.Migrate()
 	}
 	return nil
@@ -524,9 +534,9 @@ func (m *Manager) markRefreshInFlight() error {
 
 func (m *Manager) clearRefreshInFlight() { _ = os.Remove(m.inFlightPath()) }
 
-func (m *Manager) save(c *Credential) error {
+func (m *Manager) save(ctx context.Context, c *Credential) error {
 	raw, _ := json.Marshal(c)
-	return m.Store.Set(raw)
+	return m.storeFor(ctx).Set(raw)
 }
 
 // withLock serializes credential reads/refreshes/writes across every hook process of

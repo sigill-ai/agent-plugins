@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -114,4 +115,44 @@ func TestR5NonRegularCredentialFileIsRejectedWithoutBlocking(t *testing.T) {
 			t.Fatalf("an unreadable marker must be an error, never absent: b=%v err=%v", b, err)
 		}
 	})
+}
+
+// Every credential operation honours the caller's deadline, not only helperTimeout: a hook with 50 ms left
+// must not wait for an unrelated helper bound (Codex round 6, TestCodexAccessTokenHonorsCallerDeadline).
+func TestR6AccessTokenHonorsCallerDeadline(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "helper")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexec sleep 30\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldBin, oldTimeout := securityBin, helperTimeout
+	securityBin, helperTimeout = script, 800*time.Millisecond
+	t.Cleanup(func() { securityBin, helperTimeout = oldBin, oldTimeout })
+	a := authorityIn(dir, &macKeychain{account: "review"}, false)
+	if err := a.writeMarker("keychain", 1); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{Dir: dir, Store: a}
+	for _, op := range []struct {
+		name string
+		fn   func(context.Context) error
+	}{
+		{"AccessToken", func(ctx context.Context) error { _, _, err := m.AccessToken(ctx, "https://example.invalid"); return err }},
+		{"save", func(ctx context.Context) error { return m.save(ctx, &Credential{Issuer: "https://example.invalid"}) }},
+		{"Disconnect", func(ctx context.Context) error { return m.Disconnect(ctx) }},
+	} {
+		if err := a.writeMarker("keychain", 1); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		start := time.Now()
+		err := op.fn(ctx)
+		cancel()
+		if d := time.Since(start); d > 350*time.Millisecond {
+			t.Fatalf("%s: caller deadline 50ms ignored, took %s", op.name, d)
+		}
+		if op.name == "AccessToken" && err == nil {
+			t.Fatal("a stalled credential read must fail")
+		}
+	}
 }

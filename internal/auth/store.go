@@ -39,19 +39,23 @@ var (
 	secretToolBin = "secret-tool"
 )
 
-// helper runs an OS credential helper under helperTimeout. WaitDelay closes its pipes shortly after the
-// kill, so a helper whose descendants keep stdout open cannot hold Run past the deadline.
-func helper(stdin io.Reader, name string, args ...string) (out, stderr []byte, err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), helperTimeout)
+// helper runs an OS credential helper under the caller's deadline, and never longer than helperTimeout
+// (the bound for callers without one). WaitDelay closes its pipes shortly after the kill, so a helper whose
+// descendants keep stdout open cannot hold Run past the deadline.
+func helper(parent context.Context, stdin io.Reader, name string, args ...string) (out, stderr []byte, err error) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, helperTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.WaitDelay = time.Second
+	cmd.WaitDelay = 100 * time.Millisecond
 	cmd.Stdin = stdin
 	var o, e bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &o, &e
 	err = cmd.Run()
 	if ctx.Err() != nil {
-		err = fmt.Errorf("%s did not answer within %s", name, helperTimeout)
+		err = fmt.Errorf("%s did not answer in time (%v)", name, ctx.Err())
 	}
 	return o.Bytes(), e.Bytes(), err
 }
@@ -271,14 +275,35 @@ func (a *authority) Delete() error {
 	return a.file.Delete()
 }
 
+// contextBinder: a store whose I/O can block (an OS helper) returns a copy bound to the caller's context,
+// so each credential operation of a hook ends within the hook's own deadline. Manager binds per call.
+type contextBinder interface {
+	withContext(ctx context.Context) SecretStore
+}
+
+func (a *authority) withContext(ctx context.Context) SecretStore {
+	c := *a
+	if b, ok := a.primary.(contextBinder); ok {
+		c.primary = b.withContext(ctx)
+	}
+	return &c
+}
+
+func (k *macKeychain) withContext(ctx context.Context) SecretStore { c := *k; c.ctx = ctx; return &c }
+
+func (s *secretService) withContext(ctx context.Context) SecretStore { c := *s; c.ctx = ctx; return &c }
+
 // macKeychain uses `security`. The secret is written through `security -i` on STDIN, so it
 // never appears in a process argument list; base64 keeps the interactive parser simple.
-type macKeychain struct{ account string }
+type macKeychain struct {
+	account string
+	ctx     context.Context // the caller's deadline for this use (see contextBinder); nil = helperTimeout only
+}
 
 func (k *macKeychain) Name() string { return "macOS Keychain" }
 
 func (k *macKeychain) Get() ([]byte, error) {
-	out, _, err := helper(nil, securityBin, "find-generic-password", "-s", keychainService, "-a", k.account, "-w")
+	out, _, err := helper(k.ctx, nil, securityBin, "find-generic-password", "-s", keychainService, "-a", k.account, "-w")
 	return keychainResult(out, err)
 }
 
@@ -299,7 +324,7 @@ func keychainResult(out []byte, err error) ([]byte, error) {
 }
 
 func (k *macKeychain) Set(b []byte) error {
-	_, stderr, err := helper(strings.NewReader(fmt.Sprintf("add-generic-password -U -s %s -a %s -w %s\n",
+	_, stderr, err := helper(k.ctx, strings.NewReader(fmt.Sprintf("add-generic-password -U -s %s -a %s -w %s\n",
 		quote(keychainService), quote(k.account), base64.StdEncoding.EncodeToString(b))), securityBin, "-i")
 	if err != nil || strings.Contains(string(stderr), "error") {
 		return errors.New("the macOS Keychain refused the credential")
@@ -308,17 +333,20 @@ func (k *macKeychain) Set(b []byte) error {
 }
 
 func (k *macKeychain) Delete() error {
-	_, _, _ = helper(nil, securityBin, "delete-generic-password", "-s", keychainService, "-a", k.account)
+	_, _, _ = helper(k.ctx, nil, securityBin, "delete-generic-password", "-s", keychainService, "-a", k.account)
 	return nil
 }
 
 // secretService uses libsecret's `secret-tool`, which reads the secret from STDIN.
-type secretService struct{ account string }
+type secretService struct {
+	account string
+	ctx     context.Context
+}
 
 func (s *secretService) Name() string { return "Secret Service" }
 
 func (s *secretService) Get() ([]byte, error) {
-	out, stderr, err := helper(nil, secretToolBin, "lookup", "service", keychainService, "account", s.account)
+	out, stderr, err := helper(s.ctx, nil, secretToolBin, "lookup", "service", keychainService, "account", s.account)
 	return secretToolResult(out, stderr, err)
 }
 
@@ -337,13 +365,13 @@ func secretToolResult(out, stderr []byte, err error) ([]byte, error) {
 }
 
 func (s *secretService) Set(b []byte) error {
-	_, _, err := helper(strings.NewReader(base64.StdEncoding.EncodeToString(b)), secretToolBin,
+	_, _, err := helper(s.ctx, strings.NewReader(base64.StdEncoding.EncodeToString(b)), secretToolBin,
 		"store", "--label=Sigill for Claude Code", "service", keychainService, "account", s.account)
 	return err
 }
 
 func (s *secretService) Delete() error {
-	_, _, _ = helper(nil, secretToolBin, "clear", "service", keychainService, "account", s.account)
+	_, _, _ = helper(s.ctx, nil, secretToolBin, "clear", "service", keychainService, "account", s.account)
 	return nil
 }
 
