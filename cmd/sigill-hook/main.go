@@ -409,6 +409,11 @@ func (r *recorder) handle(ctx context.Context, in input) (*state.Run, error) {
 		return run, err
 
 	case "Stop":
+		// Prompts queued before an upgrade still carry urn:uuid URIs. They are unsigned until this seal, so they
+		// get production-profile URIs now (spec §10.1) — unless a seal is in flight, whose envelope is fixed.
+		if run.Pending == nil {
+			run.PendingInputs = evidence.RemintUnsigned(run.PendingInputs)
+		}
 		objs := append(append([]evidence.Object{}, run.PendingInputs...), evidence.NewObject("model-output", "text/markdown", []byte(in.LastAssistantMessage)))
 		run, err = r.event(ctx, run, in, "model_output", nil, false, false, ext, objs)
 		if err == nil {

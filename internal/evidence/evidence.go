@@ -40,11 +40,45 @@ type Object struct {
 // NewObject hashes content locally and returns its detached-object record.
 func NewObject(role, contentType string, content []byte) Object {
 	sum := sha256.Sum256(content)
-	return Object{URI: NewURN(), Role: role, ContentType: contentType, SizeBytes: len(content), SHA256: hex.EncodeToString(sum[:])}
+	return Object{URI: NewObjectURI(), Role: role, ContentType: contentType, SizeBytes: len(content), SHA256: hex.EncodeToString(sum[:])}
 }
 
-// NewURN returns an opaque urn:uuid (v4). URIs never carry personal data (§5).
-func NewURN() string { return "urn:uuid:" + NewUUID() }
+// NewObjectURI returns an opaque object reference in the AiEvidenceEnvelopeV2 v2.1 production profile:
+// objects/<uuid v4>. A relative locator reference (TS 119 182-1 §5.2.8.3.1); never personal data (§5).
+func NewObjectURI() string { return "objects/" + NewUUID() }
+
+// IsProductionReference reports whether uri matches the v2.1 production profile (§3.1): non-empty segments of
+// A–Z a–z 0–9 . _ ~ - separated by single '/', no "." or ".." segment. Governs emission only.
+func IsProductionReference(uri string) bool {
+	if uri == "" {
+		return false
+	}
+	for _, seg := range strings.Split(uri, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return false
+		}
+		for _, c := range seg {
+			if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '~' || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// RemintUnsigned gives every not-yet-sealed object whose URI predates the v2.1 production profile a fresh
+// objects/<uuid> (AiEvidenceEnvelopeV2 §10.1). Only for objects no seal has bound yet — content and digest are
+// unchanged; a URI a seal already signed is never rewritten, because callers only pass unsigned objects.
+func RemintUnsigned(objs []Object) []Object {
+	out := make([]Object, len(objs))
+	for i, o := range objs {
+		if !IsProductionReference(o.URI) {
+			o.URI = NewObjectURI()
+		}
+		out[i] = o
+	}
+	return out
+}
 
 func NewUUID() string {
 	var b [16]byte
